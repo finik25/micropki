@@ -183,16 +183,86 @@ openssl verify -CAfile ./pki/certs/ca.cert.pem -untrusted ./pki/certs/intermedia
 
 Вы можете предоставить готовый CSR вместо генерации ключа:
 ```bash
-micropki ca issue-cert \
-    --ca-cert ./pki/certs/intermediate.cert.pem \
-    --ca-key ./pki/private/intermediate.key.pem \
-    --ca-pass-file int_pass.txt \
-    --template server \
-    --csr ./path/to/request.csr \
-    --san dns:example.com \
+micropki ca issue-cert `
+    --ca-cert ./pki/certs/intermediate.cert.pem `
+    --ca-key ./pki/private/intermediate.key.pem `
+    --ca-pass-file int_pass.txt `
+    --template server `
+    --csr ./path/to/request.csr `
+    --san dns:example.com `
     --out-dir ./certs
 ```
 В этом случае приватный ключ не сохраняется, используется открытый ключ из CSR.
+
+
+
+## Управление базой данных сертификатов
+
+### Инициализация базы данных
+
+Перед выпуском сертификатов необходимо инициализировать SQLite базу данных. База будет хранить информацию о всех выданных сертификатах.
+
+```bash
+micropki db init --out-dir ./pki
+```
+
+### Просмотр выпущенных сертификатов
+
+После того как вы выпустили несколько сертификатов (корневой, промежуточный, конечные), можно просмотреть их список.
+
+```bash
+# Список всех сертификатов в виде таблицы
+micropki ca list-certs
+
+# Фильтрация по статусу (valid, revoked, expired)
+micropki ca list-certs --status valid
+
+# Вывод в формате JSON или CSV
+micropki ca list-certs --format json
+micropki ca list-certs --format csv
+```
+
+### Просмотр конкретного сертификата по серийному номеру
+
+```bash
+micropki ca show-cert 0x188667bd44d8895fc8b94dc017c77a175cad36
+```
+
+## HTTP репозиторий
+
+MicroPKI включает простой HTTP‑сервер для получения сертификатов и информации о состоянии.
+
+### Запуск сервера
+
+```bash
+micropki repo serve --host 127.0.0.1 --port 8080 --out-dir ./pki
+```
+
+Сервер будет работать до нажатия `Ctrl+C`. Все запросы логируются в консоль (или в файл, если указан `--log-file`).
+
+### Примеры запросов
+
+```bash
+# Получить сертификат по серийному номеру
+curl http://127.0.0.1:8080/certificate/0x188667bd44d8895fc8b94dc017c77a175cad36
+
+# Получить корневой сертификат
+curl http://127.0.0.1:8080/ca/root
+
+# Получить промежуточный сертификат
+curl http://127.0.0.1:8080/ca/intermediate
+
+# CRL (пока заглушка, будет реализован в Sprint 4)
+curl http://127.0.0.1:8080/crl
+```
+
+### Примечания
+
+- Серийный номер можно указывать как с префиксом `0x`, так и без него.
+- Сервер возвращает PEM‑кодированные сертификаты с Content‑Type `application/x-pem-file`.
+- Для удобства тестирования добавлены CORS‑заголовки (`Access-Control-Allow-Origin: *`).
+
+
 
 ## Запуск тестов
 
@@ -264,6 +334,25 @@ pytest tests/ -v
 |----------|----------|--------|
 | `--cert` | Путь к сертификату для проверки (только самоподписанный) | `./pki/certs/ca.cert.pem` |
 
+
+## Конфигурационный файл
+
+MicroPKI поддерживает файл `micropki.conf` в формате YAML. Пример:
+
+```yaml
+pki_dir: ./pki
+host: 0.0.0.0
+port: 8080
+log_level: INFO
+```
+
+Параметры, заданные в командной строке, имеют приоритет над конфигурационным файлом.
+
+## Проверка статуса репозитория
+```bash
+micropki repo status
+```
+Выводит, запущен ли HTTP сервер на указанном (или настроенном) хосте и порту.
 
 ## Примечания по безопасности
 
