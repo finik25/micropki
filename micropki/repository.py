@@ -5,6 +5,28 @@ import logging
 import json
 from datetime import datetime
 from . import database
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+
+
+def find_cert_in_fs(certs_dir, serial_hex):
+    """Search for a certificate by serial number in the certs directory."""
+    try:
+        serial_int = int(serial_hex, 16)
+    except ValueError:
+        return None
+    for fname in os.listdir(certs_dir):
+        if fname.endswith(('.pem', '.crt', '.cert')):
+            path = certs_dir / fname
+            try:
+                with open(path, 'rb') as f:
+                    cert = x509.load_pem_x509_certificate(f.read(), default_backend())
+                if cert.serial_number == serial_int:
+                    with open(path, 'rb') as f:
+                        return f.read()
+            except Exception:
+                continue
+    return None
 
 
 def create_app(pki_dir, log_file=None, log_format='text'):
@@ -14,7 +36,6 @@ def create_app(pki_dir, log_file=None, log_format='text'):
 
     # Configure HTTP logger
     http_logger = logging.getLogger('micropki.http')
-    # Remove any existing handlers to avoid duplication
     if http_logger.handlers:
         http_logger.handlers.clear()
     http_logger.setLevel(logging.INFO)
@@ -65,9 +86,13 @@ def create_app(pki_dir, log_file=None, log_format='text'):
             abort(404, description="Database not found")
         serial_hex = serial if serial.startswith('0x') else '0x' + serial
         cert_data = database.get_cert_by_serial(str(db_path), serial_hex)
-        if not cert_data:
-            abort(404, description="Certificate not found")
-        return Response(cert_data['cert_pem'], mimetype='application/x-pem-file')
+        if cert_data:
+            return Response(cert_data['cert_pem'], mimetype='application/x-pem-file')
+        # Fallback to filesystem search
+        pem = find_cert_in_fs(certs_dir, serial)
+        if pem:
+            return Response(pem, mimetype='application/x-pem-file')
+        abort(404, description="Certificate not found")
 
     @app.route('/ca/root')
     def get_root_ca():

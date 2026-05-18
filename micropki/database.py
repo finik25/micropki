@@ -57,14 +57,27 @@ def init_db(db_path):
     conn.commit()
     conn.close()
 
+def _apply_migration(db_path, from_ver, to_ver):
+    """Apply migration from from_ver to to_ver (to_ver = from_ver+1)."""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    if from_ver == 0 and to_ver == 1:
+        init_db(db_path)
+    # Future migrations (e.g., for Sprint 4: crl_metadata table) would go here:
+    # elif from_ver == 1 and to_ver == 2:
+    #     cursor.execute('CREATE TABLE IF NOT EXISTS crl_metadata (...')
+    else:
+        raise ValueError(f"Unknown migration from version {from_ver} to {to_ver}")
+    set_schema_version(db_path, to_ver)
+    conn.close()
+
 def migrate(db_path, target_version=1):
+    """Migrate database to target_version, applying all intermediate migrations."""
     current = get_schema_version(db_path)
     if current >= target_version:
         return
-    if current == 0:
-        init_db(db_path)
-        set_schema_version(db_path, 1)
-    # future migrations can be added here
+    for v in range(current, target_version):
+        _apply_migration(db_path, v, v+1)
 
 def insert_certificate(db_path, cert, issuer_dn=None, status='valid'):
     conn = sqlite3.connect(db_path)

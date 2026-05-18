@@ -181,6 +181,34 @@ def main():
                 sys.stderr.write(f"Error: {e}\n")
                 sys.exit(1)
 
+        elif args.ca_command == 'issue-intermediate':
+            # Проверка существования обязательных файлов
+            for f in [args.root_cert, args.root_key, args.root_pass_file, args.passphrase_file]:
+                if not os.path.isfile(f):
+                    sys.stderr.write(f"Error: File not found: {f}\n")
+                    sys.exit(1)
+            try:
+                ca.create_intermediate_ca(
+                    root_cert_path=args.root_cert,
+                    root_key_path=args.root_key,
+                    root_pass_file=args.root_pass_file,
+                    subject=args.subject,
+                    key_type=args.key_type,
+                    key_size=args.key_size,
+                    passphrase_file=args.passphrase_file,
+                    out_dir=args.out_dir,
+                    validity_days=args.validity_days,
+                    pathlen=args.pathlen,
+                    log_file=args.log_file,
+                    force=args.force,
+                    pki_dir=args.pki_dir,
+                    log_format=args.log_format
+                )
+                print("Intermediate CA created successfully.")
+            except Exception as e:
+                sys.stderr.write(f"Error: {e}\n")
+                sys.exit(1)
+
         elif args.ca_command == 'verify':
             if not os.path.isfile(args.cert):
                 sys.stderr.write(f"Error: Certificate file not found: {args.cert}\n")

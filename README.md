@@ -225,7 +225,7 @@ micropki ca list-certs --format csv
 ### Просмотр конкретного сертификата по серийному номеру
 
 ```bash
-micropki ca show-cert 0x188667bd44d8895fc8b94dc017c77a175cad36
+micropki ca show-cert 0x6521745cca871a45325873c792719
 ```
 
 ## HTTP репозиторий
@@ -244,7 +244,7 @@ micropki repo serve --host 127.0.0.1 --port 8080 --out-dir ./pki
 
 ```bash
 # Получить сертификат по серийному номеру
-curl http://127.0.0.1:8080/certificate/0x188667bd44d8895fc8b94dc017c77a175cad36
+curl http://127.0.0.1:8080/certificate/0x6521745cca871a45325873c792719
 
 # Получить корневой сертификат
 curl http://127.0.0.1:8080/ca/root

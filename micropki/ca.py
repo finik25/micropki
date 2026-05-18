@@ -334,7 +334,7 @@ def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject
         return cert_path, key_path
 
 
-def verify_certificate(cert_path):
+def verify_certificate(cert_path, subject_cert=None):
     from cryptography.hazmat.primitives.asymmetric import padding, ec
     with open(cert_path, 'rb') as f:
         cert_data = f.read()
@@ -344,22 +344,28 @@ def verify_certificate(cert_path):
     pub_key = cert.public_key()
     try:
         if isinstance(pub_key, rsa.RSAPublicKey):
+            if subject_cert.signature_hash_algorithm is None:
+                return False, "Signature hash algorithm is None"
             pub_key.verify(
-                cert.signature,
-                cert.tbs_certificate_bytes,
+                subject_cert.signature,
+                subject_cert.tbs_certificate_bytes,
                 padding.PKCS1v15(),
-                cert.signature_hash_algorithm
+                subject_cert.signature_hash_algorithm
             )
         elif isinstance(pub_key, ec.EllipticCurvePublicKey):
+            if subject_cert.signature_hash_algorithm is None:
+                return False, "Signature hash algorithm is None"
             pub_key.verify(
-                cert.signature,
-                cert.tbs_certificate_bytes,
-                ec.ECDSA(cert.signature_hash_algorithm)
+                subject_cert.signature,
+                subject_cert.tbs_certificate_bytes,
+                ec.ECDSA(subject_cert.signature_hash_algorithm)
             )
         else:
             return False, f"Unsupported key type: {type(pub_key)}"
     except Exception as e:
-        return False, f"Signature verification failed: {e}"
+        import traceback
+        traceback.print_exc()
+        return False, f"Signature verification failed: {e} (type: {type(e).__name__})"
     return True, "Certificate is valid"
 
 
