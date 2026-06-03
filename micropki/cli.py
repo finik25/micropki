@@ -62,6 +62,40 @@ def main():
     cert_parser.add_argument('--pki-dir', default='./pki', help='PKI root directory (for database)')
     cert_parser.add_argument('--force', action='store_true', help='Overwrite existing output files')
 
+    # ca revoke
+    revoke_parser = ca_subparsers.add_parser('revoke', help='Revoke a certificate')
+    revoke_parser.add_argument('serial', help='Certificate serial number (hex)')
+    revoke_parser.add_argument('--reason', default='unspecified',
+                               choices=['unspecified', 'keyCompromise', 'cACompromise',
+                                        'affiliationChanged', 'superseded', 'cessationOfOperation',
+                                        'certificateHold', 'removeFromCRL', 'privilegeWithdrawn',
+                                        'aACompromise'],
+                               help='Revocation reason')
+    revoke_parser.add_argument('--force', action='store_true', help='Skip confirmation prompts')
+    revoke_parser.add_argument('--pki-dir', default='./pki', help='PKI root directory (for database)')
+    revoke_parser.add_argument('--log-file', help='Log file path')
+    revoke_parser.add_argument('--log-format', choices=['text', 'json'], default='text')
+
+    # ca gen-crl
+    gen_crl_parser = ca_subparsers.add_parser('gen-crl', help='Generate CRL for a CA')
+    gen_crl_parser.add_argument('--ca', required=True, choices=['root', 'intermediate'],
+                                help='Which CA to generate CRL for (root or intermediate)')
+    gen_crl_parser.add_argument('--next-update', type=int, default=7,
+                                help='Days until next CRL update (default: 7)')
+    gen_crl_parser.add_argument('--out-file', help='Output file path (default: <out-dir>/crl/<ca>.crl.pem)')
+    gen_crl_parser.add_argument('--pki-dir', default='./pki', help='PKI root directory')
+    gen_crl_parser.add_argument('--log-file', help='Log file path')
+    gen_crl_parser.add_argument('--log-format', choices=['text', 'json'], default='text')
+    gen_crl_parser.add_argument('--force', action='store_true', help='Overwrite existing CRL file')
+    gen_crl_parser.add_argument('--ca-pass-file', required=True,
+                                help='File containing passphrase for CA private key')
+
+    # ca check-revoked (опционально)
+    check_revoked_parser = ca_subparsers.add_parser('check-revoked', help='Check revocation status of a certificate')
+    check_revoked_parser.add_argument('serial', help='Certificate serial number (hex)')
+    check_revoked_parser.add_argument('--pki-dir', default='./pki', help='PKI root directory')
+    check_revoked_parser.add_argument('--log-format', choices=['text', 'json'], default='text')
+
     # ca verify
     verify_parser = ca_subparsers.add_parser('verify', help='Verify a certificate')
     verify_parser.add_argument('--cert', required=True)
@@ -278,6 +312,88 @@ def main():
             else:
                 sys.stderr.write(f"Certificate with serial {args.serial} not found.\n")
                 sys.exit(1)
+
+        elif args.ca_command == 'revoke':
+            from . import revocation
+            db_path = Path(args.pki_dir) / 'micropki.db'
+            if not database.db_exists(str(db_path)):
+                sys.stderr.write(f"Database not found at {db_path}. Run 'micropki db init' first.\n")
+                sys.exit(1)
+            try:
+                revocation.revoke_certificate(
+                    str(db_path), args.serial, reason=args.reason, force=args.force,
+                    log_file=args.log_file, log_format=args.log_format
+                )
+                print(f"Certificate {args.serial} revoked successfully.")
+            except Exception as e:
+                sys.stderr.write(f"Error: {e}\n")
+                sys.exit(1)
+
+        elif args.ca_command == 'gen-crl':
+            from . import crl
+            pki_dir = Path(args.pki_dir)
+            db_path = pki_dir / 'micropki.db'
+            certs_dir = pki_dir / 'certs'
+            private_dir = pki_dir / 'private'
+            crl_dir = pki_dir / 'crl'
+            crl_dir.mkdir(exist_ok=True, parents=True)
+
+            if args.ca == 'root':
+                ca_cert = certs_dir / 'ca.cert.pem'
+                ca_key = private_dir / 'ca.key.pem'
+                default_crl_file = crl_dir / 'root.crl.pem'
+            else:  # intermediate
+                ca_cert = certs_dir / 'intermediate.cert.pem'
+                ca_key = private_dir / 'intermediate.key.pem'
+                default_crl_file = crl_dir / 'intermediate.crl.pem'
+
+            if not ca_cert.exists() or not ca_key.exists():
+                sys.stderr.write(f"CA certificate or key not found for {args.ca}\n")
+                sys.exit(1)
+
+            # Определяем файл пароля для CA
+            if args.ca == 'root':
+                ca_pass_file = args.ca_pass_file
+                if not os.path.isfile(ca_pass_file):
+                    sys.stderr.write(f"CA passphrase file not found: {ca_pass_file}\n")
+                    sys.exit(1)
+
+                out_file = args.out_file if args.out_file else str(default_crl_file)
+                if os.path.exists(out_file) and not args.force:
+                    sys.stderr.write(f"CRL file {out_file} already exists. Use --force to overwrite.\n")
+                    sys.exit(1)
+
+                try:
+                    crl.generate_crl(
+                        db_path=str(db_path),
+                        ca_cert_path=str(ca_cert),
+                        ca_key_path=str(ca_key),
+                        ca_pass_file=ca_pass_file,
+                        out_file=out_file,
+                        next_update_days=args.next_update,
+                        log_file=args.log_file,
+                        log_format=args.log_format
+                    )
+                    print(f"CRL generated for {args.ca} CA: {out_file}")
+                except Exception as e:
+                    sys.stderr.write(f"Error generating CRL: {e}\n")
+                    sys.exit(1)
+
+            elif args.ca_command == 'check-revoked':
+                db_path = Path(args.pki_dir) / 'micropki.db'
+                if not database.db_exists(str(db_path)):
+                    sys.stderr.write(f"Database not found at {db_path}\n")
+                    sys.exit(1)
+                serial_hex = args.serial if args.serial.startswith('0x') else '0x' + args.serial
+                cert = database.get_cert_by_serial(str(db_path), serial_hex)
+                if not cert:
+                    print(f"Certificate {args.serial} not found")
+                    sys.exit(1)
+                if cert['status'] == 'revoked':
+                    print(
+                        f"Certificate {args.serial} is REVOKED. Reason: {cert['revocation_reason']}, Date: {cert['revocation_date']}")
+                else:
+                    print(f"Certificate {args.serial} is {cert['status']} (not revoked)")
 
     elif args.command == 'repo':
         cfg = load_config()

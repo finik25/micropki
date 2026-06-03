@@ -3,7 +3,7 @@ from pathlib import Path
 from flask import Flask, abort, request, Response
 import logging
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from . import database
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
@@ -91,6 +91,7 @@ def create_app(pki_dir, log_file=None, log_format='text'):
         # Fallback to filesystem search
         pem = find_cert_in_fs(certs_dir, serial)
         if pem:
+            http_logger.info(f"Fallback: certificate {serial} found in filesystem (not in DB)")
             return Response(pem, mimetype='application/x-pem-file')
         abort(404, description="Certificate not found")
 
@@ -122,7 +123,33 @@ def create_app(pki_dir, log_file=None, log_format='text'):
 
     @app.route('/crl')
     def get_crl():
-        return Response("CRL generation not yet implemented", status=501, mimetype='text/plain')
+        ca_param = request.args.get('ca', 'intermediate')  # по умолчанию intermediate
+        if ca_param not in ('root', 'intermediate'):
+            abort(400, description="ca parameter must be 'root' or 'intermediate'")
+        crl_dir = Path(app.config.get('PKI_DIR', pki_dir)) / 'crl'
+        crl_file = crl_dir / f'{ca_param}.crl.pem'
+        if not crl_file.exists():
+            abort(404, description=f"CRL for {ca_param} CA not found")
+        # Отдаём с правильным Content-Type
+        response = Response(crl_file.read_bytes(), mimetype='application/pkix-crl')
+        # Добавляем кэширующие заголовки (опционально)
+        mtime = os.path.getmtime(crl_file)
+        response.headers['Last-Modified'] = datetime.fromtimestamp(mtime, timezone.utc).strftime('%a, %d %b %Y %H:%M:%S GMT')
+        # max-age = nextUpdate - now (упрощённо: 1 час, можно вычислить из метаданных)
+        # Для простоты ставим 3600 секунд
+        response.headers['Cache-Control'] = 'max-age=3600'
+        # ETag можно добавить, но не обязательно
+        return response
+
+    @app.route('/crl/<ca>.crl')
+    def get_crl_by_path(ca):
+        if ca not in ('root', 'intermediate'):
+            abort(400)
+        crl_dir = Path(app.config.get('PKI_DIR', pki_dir)) / 'crl'
+        crl_file = crl_dir / f'{ca}.crl.pem'
+        if not crl_file.exists():
+            abort(404)
+        return Response(crl_file.read_bytes(), mimetype='application/pkix-crl')
 
     @app.after_request
     def add_cors_headers(response):

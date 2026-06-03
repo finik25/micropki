@@ -1,4 +1,3 @@
-
 # MicroPKI
 
 Учебный проект по созданию минимальной, но полной инфраструктуры публичных ключей (PKI).  
@@ -10,6 +9,8 @@
 - Выпуск сертификатов по шаблонам: `server`, `client`, `code_signing`
 - Поддержка Subject Alternative Names (SAN): dns, ip, email, uri
 - Проверка цепочки сертификатов
+- Отзыв сертификатов и генерация CRL (Certificate Revocation List) согласно RFC 5280
+- HTTP репозиторий для выдачи сертификатов и CRL
 - Шифрование приватных ключей CA (PKCS#8, AES-256)
 - Поддержка внешних CSR (опционально)
 - Логирование операций
@@ -24,14 +25,14 @@ micropki/
 │   ├── cli.py             # Парсер аргументов командной строки
 │   ├── ca.py              # Логика CA (инициализация, выпуск, цепочки)
 │   ├── certificates.py    # Создание X.509 сертификатов, CSR, шаблоны, SAN
+│   ├── crl.py             # Генерация CRL
+│   ├── revocation.py      # Отзыв сертификатов
 │   ├── crypto_utils.py    # Генерация и шифрование ключей
+│   ├── database.py        # Работа с SQLite базой данных
+│   ├── repository.py      # HTTP репозиторий (Flask)
 │   └── logger.py          # Настройка логирования
 ├── tests/                 # Модульные тесты (pytest)
-│   ├── test_ca.py
-│   ├── test_certificates.py
-│   ├── test_crypto_utils.py
-│   └── test_sprint2.py
-├── requirements.txt       # Зависимости (cryptography, pytest)
+├── requirements.txt       # Зависимости (cryptography, pytest, Flask, pyyaml)
 ├── setup.py               # Установка пакета (entry point micropki)
 ├── .gitignore
 └── README.md
@@ -41,6 +42,7 @@ micropki/
 
 - Python 3.8 или выше
 - Библиотека `cryptography` (устанавливается автоматически)
+- OpenSSL (для проверки CRL, опционально)
 
 ## Установка
 
@@ -79,13 +81,15 @@ micropki ca init `
     --key-size 4096 `
     --passphrase-file pass.txt `
     --out-dir ./pki `
-    --validity-days 3650
+    --validity-days 3650 `
+    --force
 ```
 
 После успешного выполнения в директории `pki` появятся:
 - `private/ca.key.pem` – зашифрованный приватный ключ (PEM, PKCS#8)
 - `certs/ca.cert.pem` – самоподписанный сертификат (PEM)
 - `policy.txt` – текстовый документ политики CA
+- `crl/` – директория для будущих CRL
 
 Проверка с помощью OpenSSL:
 ```bash
@@ -112,7 +116,8 @@ micropki ca issue-intermediate `
     --passphrase-file int_pass.txt `
     --out-dir ./pki `
     --validity-days 1825 `
-    --pathlen 0
+    --pathlen 0 `
+    --force
 ```
 
 Будут созданы:
@@ -133,7 +138,8 @@ micropki ca issue-cert `
     --san dns:www.example.com `
     --san ip:192.168.1.10 `
     --out-dir ./certs `
-    --validity-days 365
+    --validity-days 365 `
+    --force
 ```
 Результат: `certs/example.com.cert.pem` и `certs/example.com.key.pem` (незашифрованный).
 
@@ -146,7 +152,8 @@ micropki ca issue-cert `
     --template client `
     --subject "CN=Alice Smith,EMAIL=alice@example.com" `
     --san email:alice@example.com `
-    --out-dir ./certs
+    --out-dir ./certs `
+    --force
 ```
 
 #### Сертификат для подписи кода
@@ -157,10 +164,43 @@ micropki ca issue-cert `
     --ca-pass-file int_pass.txt `
     --template code_signing `
     --subject "CN=MicroPKI Code Signer" `
-    --out-dir ./certs
+    --out-dir ./certs `
+    --force
 ```
 
-### 4. Проверка цепочки сертификатов
+### 4. Отзыв сертификата
+
+```bash
+# Отозвать сертификат по серийному номеру
+micropki ca revoke 0x2A7F... --reason keyCompromise
+
+# С указанием причины и без подтверждения
+micropki ca revoke 0x3B8E... --reason superseded --force
+```
+
+Поддерживаемые причины отзыва: `unspecified`, `keyCompromise`, `cACompromise`, `affiliationChanged`, `superseded`, `cessationOfOperation`, `certificateHold`, `removeFromCRL`, `privilegeWithdrawn`, `aACompromise`.
+
+### 5. Генерация CRL
+
+После отзыва необходимо сгенерировать новый список отозванных сертификатов:
+
+```bash
+# Сгенерировать CRL для промежуточного CA со сроком действия 14 дней
+micropki ca gen-crl --ca intermediate --next-update 14 --ca-pass-file int_pass.txt --force
+
+# Для корневого CA с перезаписью существующего файла
+micropki ca gen-crl --ca root --next-update 7 --ca-pass-file pass.txt --force
+```
+
+CRL сохраняются в директории `pki/crl/` как `root.crl.pem` и `intermediate.crl.pem`.
+
+### 6. Проверка статуса отзыва
+
+```bash
+micropki ca check-revoked 0x2A7F...
+```
+
+### 7. Проверка цепочки сертификатов
 
 ```bash
 micropki ca verify-chain `
@@ -169,7 +209,7 @@ micropki ca verify-chain `
     --root ./pki/certs/ca.cert.pem
 ```
 
-### 5. Проверка с помощью OpenSSL
+### 8. Проверка с помощью OpenSSL
 
 ```bash
 # Просмотр информации о сертификате
@@ -177,6 +217,15 @@ openssl x509 -in ./certs/example.com.cert.pem -text -noout
 
 # Проверка цепочки (root + intermediate)
 openssl verify -CAfile ./pki/certs/ca.cert.pem -untrusted ./pki/certs/intermediate.cert.pem ./certs/example.com.cert.pem
+
+# Просмотр CRL
+openssl crl -in pki/crl/root.crl.pem -text -noout
+
+# Проверка подписи CRL
+openssl crl -in pki/crl/root.crl.pem -CAfile pki/certs/ca.cert.pem -noout
+
+# Проверка отзыва с помощью CRL (должна завершиться ошибкой для отозванного сертификата)
+openssl verify -CAfile pki/certs/ca.cert.pem -CRLfile pki/crl/root.crl.pem -crl_check ./certs/example.com.cert.pem
 ```
 
 ## Поддержка внешнего CSR (опционально)
@@ -190,11 +239,10 @@ micropki ca issue-cert `
     --template server `
     --csr ./path/to/request.csr `
     --san dns:example.com `
-    --out-dir ./certs
+    --out-dir ./certs `
+    --force
 ```
 В этом случае приватный ключ не сохраняется, используется открытый ключ из CSR.
-
-
 
 ## Управление базой данных сертификатов
 
@@ -230,7 +278,7 @@ micropki ca show-cert 0x6521745cca871a45325873c792719
 
 ## HTTP репозиторий
 
-MicroPKI включает простой HTTP‑сервер для получения сертификатов и информации о состоянии.
+MicroPKI включает простой HTTP‑сервер для получения сертификатов, CRL и информации о состоянии.
 
 ### Запуск сервера
 
@@ -252,17 +300,21 @@ curl http://127.0.0.1:8080/ca/root
 # Получить промежуточный сертификат
 curl http://127.0.0.1:8080/ca/intermediate
 
-# CRL (пока заглушка, будет реализован в Sprint 4)
+# Получить CRL промежуточного CA (по умолчанию)
 curl http://127.0.0.1:8080/crl
+
+# Получить CRL корневого CA
+curl http://127.0.0.1:8080/crl?ca=root
+
+# Альтернативный путь
+curl http://127.0.0.1:8080/crl/root.crl
 ```
 
 ### Примечания
 
 - Серийный номер можно указывать как с префиксом `0x`, так и без него.
-- Сервер возвращает PEM‑кодированные сертификаты с Content‑Type `application/x-pem-file`.
+- Сервер возвращает PEM‑кодированные сертификаты с Content‑Type `application/x-pem-file`, а CRL — с `application/pkix-crl`.
 - Для удобства тестирования добавлены CORS‑заголовки (`Access-Control-Allow-Origin: *`).
-
-
 
 ## Запуск тестов
 
@@ -270,8 +322,7 @@ curl http://127.0.0.1:8080/crl
 pip install pytest
 pytest tests/ -v
 ```
-Все тесты должны проходить успешно (19 тестов в Sprint 2).
-
+Все тесты (включая тесты отзыва и CRL) должны проходить успешно.
 
 ## Параметры команд
 
@@ -319,6 +370,35 @@ pytest tests/ -v
 | `--out-dir` | Директория для вывода (по умолчанию `./pki/certs`) | `./certs` |
 | `--validity-days` | Срок действия сертификата (по умолчанию 365) | `365` |
 | `--log-file` | Путь к файлу лога | `./logs/issue.log` |
+| `--force` | Перезаписывать существующие файлы | `--force` |
+
+### `ca revoke` (Sprint 4)
+
+| Аргумент | Описание | Пример |
+|----------|----------|--------|
+| `serial` | Серийный номер сертификата (шестнадцатеричный) | `0x2A7F...` |
+| `--reason` | Причина отзыва (по умолчанию `unspecified`) | `keyCompromise` |
+| `--force` | Пропустить подтверждение | `--force` |
+| `--pki-dir` | Корневая директория PKI (по умолчанию `./pki`) | `./pki` |
+| `--log-file` | Путь к файлу лога | `./logs/revoke.log` |
+
+### `ca gen-crl` (Sprint 4)
+
+| Аргумент | Описание | Пример |
+|----------|----------|--------|
+| `--ca` | Какой CA: `root` или `intermediate` | `root` |
+| `--next-update` | Дней до следующего обновления CRL (по умолчанию 7) | `14` |
+| `--out-file` | Путь для сохранения CRL (опционально) | `./custom.crl.pem` |
+| `--ca-pass-file` | Файл с парольной фразой для ключа CA | `pass.txt` |
+| `--pki-dir` | Корневая директория PKI (по умолчанию `./pki`) | `./pki` |
+| `--force` | Перезаписывать существующий CRL | `--force` |
+
+### `ca check-revoked` (Sprint 4)
+
+| Аргумент | Описание | Пример |
+|----------|----------|--------|
+| `serial` | Серийный номер сертификата (шестнадцатеричный) | `0x2A7F...` |
+| `--pki-dir` | Корневая директория PKI (по умолчанию `./pki`) | `./pki` |
 
 ### `ca verify-chain` (Sprint 2)
 
@@ -333,7 +413,6 @@ pytest tests/ -v
 | Аргумент | Описание | Пример |
 |----------|----------|--------|
 | `--cert` | Путь к сертификату для проверки (только самоподписанный) | `./pki/certs/ca.cert.pem` |
-
 
 ## Конфигурационный файл
 
@@ -360,3 +439,4 @@ micropki repo status
 - Ключи конечных сущностей сохраняются незашифрованными с правами `600`. Будьте внимательны с их хранением.
 - Парольные фразы не выводятся в логах.
 - На Unix-системах для директории `private` устанавливаются права `700`.
+- CRL подписываются тем же ключом, что и соответствующий CA, что гарантирует их подлинность.

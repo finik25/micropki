@@ -2,6 +2,9 @@ import pytest
 import tempfile
 import json
 from pathlib import Path
+
+from cryptography.hazmat.primitives import serialization
+
 from micropki import database, ca, repository
 from flask import Flask
 from datetime import datetime, timezone, timedelta
@@ -64,7 +67,7 @@ def test_http_endpoints():
         resp = client.get('/ca/intermediate')
         assert resp.status_code == 200
         resp = client.get('/crl')
-        assert resp.status_code == 501
+        assert resp.status_code == 404
         resp = client.get('/certificate/nothex')
         assert resp.status_code == 400
 
@@ -220,3 +223,45 @@ def test_full_integration_workflow():
         resp = client.get(f'/certificate/{serial_hex}')
         assert resp.status_code == 200
         assert resp.data == cert_paths[0].read_bytes()
+
+def test_repository_certificate_fetch_fallback():
+    """Test REPO-5: certificate not in DB, but found in filesystem"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pki_dir = Path(tmpdir) / 'pki'
+        pki_dir.mkdir(parents=True, exist_ok=True)
+        certs_dir = pki_dir / 'certs'
+        certs_dir.mkdir()
+        db_path = pki_dir / 'micropki.db'
+        database.init_db(str(db_path))  # DB exists but no certificate record
+
+        # Generate a self-signed certificate and save directly to certs/
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "fallback-test")])
+        cert = x509.CertificateBuilder() \
+            .subject_name(subject) \
+            .issuer_name(subject) \
+            .public_key(private_key.public_key()) \
+            .serial_number(123456789) \
+            .not_valid_before(datetime.now(timezone.utc)) \
+            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365)) \
+            .sign(private_key, hashes.SHA256())
+        cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+        cert_file = certs_dir / 'fallback_test.cert.pem'
+        cert_file.write_bytes(cert_pem)
+
+        app = repository.create_app(str(pki_dir))
+        client = app.test_client()
+
+        # Request certificate by serial (should be found in FS)
+        serial_hex = hex(cert.serial_number)
+        resp = client.get(f'/certificate/{serial_hex}')
+        assert resp.status_code == 200
+        assert resp.data == cert_pem
+
+        # Verify that the certificate is NOT in the DB (to ensure fallback was used)
+        cert_data = database.get_cert_by_serial(str(db_path), serial_hex)
+        assert cert_data is None

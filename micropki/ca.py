@@ -27,6 +27,8 @@ def init_ca(subject, key_type, key_size, passphrase_file, out_dir, validity_days
     out_path = Path(out_dir)
     private_dir = out_path / 'private'
     certs_dir = out_path / 'certs'
+    crl_dir = out_path / 'crl'
+    crl_dir.mkdir(exist_ok=True, parents=True)
     out_path.mkdir(exist_ok=True, parents=True)
     private_dir.mkdir(exist_ok=True, parents=True)
     certs_dir.mkdir(exist_ok=True, parents=True)
@@ -105,6 +107,8 @@ def create_intermediate_ca(root_cert_path, root_key_path, root_pass_file, subjec
     out_path = Path(out_dir)
     private_dir = out_path / 'private'
     certs_dir = out_path / 'certs'
+    crl_dir = out_path / 'crl'
+    crl_dir.mkdir(exist_ok=True, parents=True)
     key_path = private_dir / 'intermediate.key.pem'
     cert_path = certs_dir / 'intermediate.cert.pem'
 

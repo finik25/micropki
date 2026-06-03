@@ -7,7 +7,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 def db_exists(db_path):
     return os.path.exists(db_path)
@@ -71,8 +71,10 @@ def _apply_migration(db_path, from_ver, to_ver):
     set_schema_version(db_path, to_ver)
     conn.close()
 
-def migrate(db_path, target_version=1):
-    """Migrate database to target_version, applying all intermediate migrations."""
+def migrate(db_path, target_version=None):
+    """Migrate database to target_version (default: SCHEMA_VERSION), applying all intermediate migrations."""
+    if target_version is None:
+        target_version = SCHEMA_VERSION
     current = get_schema_version(db_path)
     if current >= target_version:
         return
@@ -166,6 +168,85 @@ def get_revoked_certs(db_path):
         WHERE status = 'revoked'
         ORDER BY revocation_date DESC
     ''')
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+def _apply_migration(db_path, from_ver, to_ver):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    try:
+        if from_ver == 0 and to_ver == 1:
+            init_db(db_path)  # создаёт certificates
+        elif from_ver == 1 and to_ver == 2:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS crl_metadata (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ca_subject TEXT NOT NULL UNIQUE,
+                    crl_number INTEGER NOT NULL,
+                    last_generated TEXT NOT NULL,
+                    next_update TEXT NOT NULL,
+                    crl_path TEXT NOT NULL
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_ca_subject ON crl_metadata(ca_subject)')
+        else:
+            raise ValueError(f"Unknown migration from {from_ver} to {to_ver}")
+        conn.commit()
+    finally:
+        conn.close()
+    set_schema_version(db_path, to_ver)
+
+# Новые функции для работы с CRL метаданными
+def get_crl_metadata(db_path, ca_subject):
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM crl_metadata WHERE ca_subject = ?', (ca_subject,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        if conn:
+            conn.close()
+
+def update_crl_metadata(db_path, ca_subject, crl_number, last_generated, next_update, crl_path):
+    """Вставить или обновить запись crl_metadata."""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO crl_metadata
+        (ca_subject, crl_number, last_generated, next_update, crl_path)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (ca_subject, crl_number, last_generated, next_update, crl_path))
+    conn.commit()
+    conn.close()
+
+def get_next_crl_number(db_path, ca_subject):
+    """Получить следующий CRL номер (текущий + 1), если записи нет – начать с 1."""
+    meta = get_crl_metadata(db_path, ca_subject)
+    if meta is None:
+        return 1
+    return meta['crl_number'] + 1
+
+def increment_crl_number(db_path, ca_subject, last_generated, next_update, crl_path):
+    """Увеличить номер CRL и обновить метаданные."""
+    new_number = get_next_crl_number(db_path, ca_subject)
+    update_crl_metadata(db_path, ca_subject, new_number, last_generated, next_update, crl_path)
+    return new_number
+
+def get_revoked_certs_for_issuer(db_path, issuer_dn):
+    """Вернуть список отозванных сертификатов, выпущенных указанным issuer (DN в формате rfc4514)."""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT serial_hex, revocation_date, revocation_reason
+        FROM certificates
+        WHERE status = 'revoked' AND issuer = ?
+        ORDER BY revocation_date DESC
+    ''', (issuer_dn,))
     rows = cursor.fetchall()
     conn.close()
     return [dict(row) for row in rows]
