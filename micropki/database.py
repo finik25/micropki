@@ -34,7 +34,6 @@ def set_schema_version(db_path, version):
     conn.close()
 
 def init_db(db_path):
-    """Create certificates table and indexes if not exists."""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute('''
@@ -58,21 +57,31 @@ def init_db(db_path):
     conn.close()
 
 def _apply_migration(db_path, from_ver, to_ver):
-    """Apply migration from from_ver to to_ver (to_ver = from_ver+1)."""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    if from_ver == 0 and to_ver == 1:
-        init_db(db_path)
-    # Future migrations (e.g., for Sprint 4: crl_metadata table) would go here:
-    # elif from_ver == 1 and to_ver == 2:
-    #     cursor.execute('CREATE TABLE IF NOT EXISTS crl_metadata (...')
-    else:
-        raise ValueError(f"Unknown migration from version {from_ver} to {to_ver}")
+    try:
+        if from_ver == 0 and to_ver == 1:
+            init_db(db_path)
+        elif from_ver == 1 and to_ver == 2:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS crl_metadata (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ca_subject TEXT NOT NULL UNIQUE,
+                    crl_number INTEGER NOT NULL,
+                    last_generated TEXT NOT NULL,
+                    next_update TEXT NOT NULL,
+                    crl_path TEXT NOT NULL
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_ca_subject ON crl_metadata(ca_subject)')
+        else:
+            raise ValueError(f"Unknown migration from {from_ver} to {to_ver}")
+        conn.commit()
+    finally:
+        conn.close()
     set_schema_version(db_path, to_ver)
-    conn.close()
 
 def migrate(db_path, target_version=None):
-    """Migrate database to target_version (default: SCHEMA_VERSION), applying all intermediate migrations."""
     if target_version is None:
         target_version = SCHEMA_VERSION
     current = get_schema_version(db_path)
@@ -172,32 +181,6 @@ def get_revoked_certs(db_path):
     conn.close()
     return [dict(row) for row in rows]
 
-def _apply_migration(db_path, from_ver, to_ver):
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    try:
-        if from_ver == 0 and to_ver == 1:
-            init_db(db_path)  # создаёт certificates
-        elif from_ver == 1 and to_ver == 2:
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS crl_metadata (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ca_subject TEXT NOT NULL UNIQUE,
-                    crl_number INTEGER NOT NULL,
-                    last_generated TEXT NOT NULL,
-                    next_update TEXT NOT NULL,
-                    crl_path TEXT NOT NULL
-                )
-            ''')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_ca_subject ON crl_metadata(ca_subject)')
-        else:
-            raise ValueError(f"Unknown migration from {from_ver} to {to_ver}")
-        conn.commit()
-    finally:
-        conn.close()
-    set_schema_version(db_path, to_ver)
-
-# Новые функции для работы с CRL метаданными
 def get_crl_metadata(db_path, ca_subject):
     conn = None
     try:
@@ -212,7 +195,6 @@ def get_crl_metadata(db_path, ca_subject):
             conn.close()
 
 def update_crl_metadata(db_path, ca_subject, crl_number, last_generated, next_update, crl_path):
-    """Вставить или обновить запись crl_metadata."""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute('''
@@ -224,20 +206,17 @@ def update_crl_metadata(db_path, ca_subject, crl_number, last_generated, next_up
     conn.close()
 
 def get_next_crl_number(db_path, ca_subject):
-    """Получить следующий CRL номер (текущий + 1), если записи нет – начать с 1."""
     meta = get_crl_metadata(db_path, ca_subject)
     if meta is None:
         return 1
     return meta['crl_number'] + 1
 
 def increment_crl_number(db_path, ca_subject, last_generated, next_update, crl_path):
-    """Увеличить номер CRL и обновить метаданные."""
     new_number = get_next_crl_number(db_path, ca_subject)
     update_crl_metadata(db_path, ca_subject, new_number, last_generated, next_update, crl_path)
     return new_number
 
 def get_revoked_certs_for_issuer(db_path, issuer_dn):
-    """Вернуть список отозванных сертификатов, выпущенных указанным issuer (DN в формате rfc4514)."""
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -250,3 +229,24 @@ def get_revoked_certs_for_issuer(db_path, issuer_dn):
     rows = cursor.fetchall()
     conn.close()
     return [dict(row) for row in rows]
+
+def get_cert_object_by_serial(db_path, serial_hex):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT cert_pem FROM certificates WHERE serial_hex = ?", (serial_hex,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return x509.load_pem_x509_certificate(row[0].encode('utf-8'), default_backend())
+
+def get_cert_object_by_serial_and_issuer(db_path, serial_hex, issuer_dn):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT cert_pem FROM certificates WHERE serial_hex = ? AND issuer = ?",
+                   (serial_hex, issuer_dn))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return x509.load_pem_x509_certificate(row[0].encode('utf-8'), default_backend())

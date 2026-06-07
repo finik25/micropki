@@ -15,8 +15,8 @@ class JSONFormatter(logging.Formatter):
             log_entry['exception'] = self.formatException(record.exc_info)
         return json.dumps(log_entry)
 
-def setup_logging(log_file=None, level=logging.INFO, log_format='text'):
-    logger = logging.getLogger('micropki')
+def setup_logging(log_file=None, level=logging.INFO, log_format='text', logger_name='micropki'):
+    logger = logging.getLogger(logger_name)
     if logger.handlers:
         return logger
     logger.setLevel(level)

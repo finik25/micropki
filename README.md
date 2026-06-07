@@ -1,19 +1,21 @@
+
 # MicroPKI
 
 Учебный проект по созданию минимальной, но полной инфраструктуры публичных ключей (PKI).  
-Реализован на Python с использованием библиотеки `cryptography`.
+Реализован на Python с использованием библиотеки `cryptography` (версия 48.0.0) и `asn1crypto` (1.5.1).
 
 ## Возможности
 
 - Создание корневого (Root) и промежуточного (Intermediate) удостоверяющих центров
-- Выпуск сертификатов по шаблонам: `server`, `client`, `code_signing`
+- Выпуск сертификатов по шаблонам: `server`, `client`, `code_signing`, `ocsp_signer`
 - Поддержка Subject Alternative Names (SAN): dns, ip, email, uri
 - Проверка цепочки сертификатов
 - Отзыв сертификатов и генерация CRL (Certificate Revocation List) согласно RFC 5280
-- HTTP репозиторий для выдачи сертификатов и CRL
+- **OCSP-ответчик** (Online Certificate Status Protocol) с поддержкой nonce, кэшированием и полным логированием
+- HTTP репозиторий для выдачи сертификатов, CRL и OCSP-ответов
 - Шифрование приватных ключей CA (PKCS#8, AES-256)
 - Поддержка внешних CSR (опционально)
-- Логирование операций
+- Логирование операций (текст/JSON)
 
 ## Структура проекта
 
@@ -21,32 +23,35 @@
 micropki/
 ├── micropki/              # Основной пакет
 │   ├── __init__.py
-│   ├── __main__.py        # Точка входа для python -m micropki
-│   ├── cli.py             # Парсер аргументов командной строки
+│   ├── __main__.py
+│   ├── cli.py             # Парсер командной строки
 │   ├── ca.py              # Логика CA (инициализация, выпуск, цепочки)
 │   ├── certificates.py    # Создание X.509 сертификатов, CSR, шаблоны, SAN
 │   ├── crl.py             # Генерация CRL
 │   ├── revocation.py      # Отзыв сертификатов
 │   ├── crypto_utils.py    # Генерация и шифрование ключей
-│   ├── database.py        # Работа с SQLite базой данных
+│   ├── database.py        # Работа с SQLite (схема, миграции)
 │   ├── repository.py      # HTTP репозиторий (Flask)
-│   └── logger.py          # Настройка логирования
+│   ├── ocsp.py            # Парсинг и формирование OCSP-запросов/ответов
+│   ├── ocsp_responder.py  # Flask‑приложение OCSP-ответчика с кэшированием
+│   ├── logger.py          # Настройка логирования
+│   └── config.py          # Конфигурация (YAML)
 ├── tests/                 # Модульные тесты (pytest)
-├── requirements.txt       # Зависимости (cryptography, pytest, Flask, pyyaml)
-├── setup.py               # Установка пакета (entry point micropki)
-├── .gitignore
+├── requirements.txt
+├── setup.py
+├── pytest.ini
 └── README.md
 ```
 
 ## Требования
 
 - Python 3.8 или выше
-- Библиотека `cryptography` (устанавливается автоматически)
-- OpenSSL (для проверки CRL, опционально)
+- Библиотеки: `cryptography>=42.0.0`, `asn1crypto>=1.5.0`, `Flask>=2.0`, `pytest>=6.0`, `pyyaml>=6.0`
+- OpenSSL (для проверки CRL и OCSP, опционально)
 
 ## Установка
 
-1. Клонируйте репозиторий:
+1. Клонируйте репозиторий и перейдите в папку проекта:
    ```bash
    git clone <url>
    cd micropki
@@ -85,9 +90,9 @@ micropki ca init `
     --force
 ```
 
-После успешного выполнения в директории `pki` появятся:
+После выполнения в директории `pki` появятся:
 - `private/ca.key.pem` – зашифрованный приватный ключ (PEM, PKCS#8)
-- `certs/ca.cert.pem` – самоподписанный сертификат (PEM)
+- `certs/ca.cert.pem` – самоподписанный сертификат
 - `policy.txt` – текстовый документ политики CA
 - `crl/` – директория для будущих CRL
 
@@ -99,13 +104,9 @@ openssl verify -CAfile pki/certs/ca.cert.pem pki/certs/ca.cert.pem
 
 ### 2. Создание промежуточного CA (Intermediate)
 
-Создайте файл пароля для промежуточного CA:
 ```bash
 echo "intsecret" > int_pass.txt
-```
 
-Затем выполните:
-```bash
 micropki ca issue-intermediate `
     --root-cert ./pki/certs/ca.cert.pem `
     --root-key ./pki/private/ca.key.pem `
@@ -124,7 +125,7 @@ micropki ca issue-intermediate `
 - `pki/private/intermediate.key.pem` (зашифрован)
 - `pki/certs/intermediate.cert.pem`
 
-### 3. Выпуск сертификатов (end-entity)
+### 3. Выпуск конечных сертификатов (end-entity)
 
 #### Сертификат сервера (с DNS и IP SAN)
 ```bash
@@ -182,17 +183,15 @@ micropki ca revoke 0x3B8E... --reason superseded --force
 
 ### 5. Генерация CRL
 
-После отзыва необходимо сгенерировать новый список отозванных сертификатов:
-
 ```bash
-# Сгенерировать CRL для промежуточного CA со сроком действия 14 дней
+# CRL для промежуточного CA (срок действия 14 дней)
 micropki ca gen-crl --ca intermediate --next-update 14 --ca-pass-file int_pass.txt --force
 
-# Для корневого CA с перезаписью существующего файла
+# CRL для корневого CA (7 дней)
 micropki ca gen-crl --ca root --next-update 7 --ca-pass-file pass.txt --force
 ```
 
-CRL сохраняются в директории `pki/crl/` как `root.crl.pem` и `intermediate.crl.pem`.
+CRL сохраняются в `pki/crl/` как `root.crl.pem` и `intermediate.crl.pem`.
 
 ### 6. Проверка статуса отзыва
 
@@ -209,86 +208,81 @@ micropki ca verify-chain `
     --root ./pki/certs/ca.cert.pem
 ```
 
-### 8. Проверка с помощью OpenSSL
+### 8. OCSP‑ответчик (Online Certificate Status Protocol)
+
+#### Выпуск сертификата для OCSP‑подписи
 
 ```bash
-# Просмотр информации о сертификате
-openssl x509 -in ./certs/example.com.cert.pem -text -noout
-
-# Проверка цепочки (root + intermediate)
-openssl verify -CAfile ./pki/certs/ca.cert.pem -untrusted ./pki/certs/intermediate.cert.pem ./certs/example.com.cert.pem
-
-# Просмотр CRL
-openssl crl -in pki/crl/root.crl.pem -text -noout
-
-# Проверка подписи CRL
-openssl crl -in pki/crl/root.crl.pem -CAfile pki/certs/ca.cert.pem -noout
-
-# Проверка отзыва с помощью CRL (должна завершиться ошибкой для отозванного сертификата)
-openssl verify -CAfile pki/certs/ca.cert.pem -CRLfile pki/crl/root.crl.pem -crl_check ./certs/example.com.cert.pem
-```
-
-## Поддержка внешнего CSR (опционально)
-
-Вы можете предоставить готовый CSR вместо генерации ключа:
-```bash
-micropki ca issue-cert `
+micropki ca issue-ocsp-cert `
     --ca-cert ./pki/certs/intermediate.cert.pem `
     --ca-key ./pki/private/intermediate.key.pem `
     --ca-pass-file int_pass.txt `
-    --template server `
-    --csr ./path/to/request.csr `
-    --san dns:example.com `
-    --out-dir ./certs `
+    --subject "CN=OCSP Responder" `
+    --key-type rsa --key-size 2048 `
+    --out-dir ./pki/certs `
     --force
 ```
-В этом случае приватный ключ не сохраняется, используется открытый ключ из CSR.
 
-## Управление базой данных сертификатов
+#### Запуск OCSP‑сервера
 
-### Инициализация базы данных
+```bash
+micropki ocsp serve `
+    --host 127.0.0.1 --port 8081 `
+    --db-path ./pki/micropki.db `
+    --responder-cert ./pki/certs/OCSP_Responder.cert.pem `
+    --responder-key ./pki/certs/OCSP_Responder.key.pem `
+    --ca-cert ./pki/certs/intermediate.cert.pem `
+    --cache-ttl 120 `
+    --log-file ./logs/ocsp.log
+```
 
-Перед выпуском сертификатов необходимо инициализировать SQLite базу данных. База будет хранить информацию о всех выданных сертификатах.
+#### Проверка OCSP с помощью OpenSSL
+
+```bash
+openssl ocsp -issuer pki/certs/intermediate.cert.pem `
+    -cert certs/example.com.cert.pem `
+    -url http://127.0.0.1:8081/ocsp `
+    -CAfile pki/certs/ca.cert.pem `
+    -resp_text -no_nonce
+```
+
+**Примечания:**
+- OCSP-ответчик поддерживает nonce (защита от повторов) и кэширование ответов с TTL (по умолчанию 60 секунд).
+- Для неизвестных сертификатов возвращается HTTP 404 (это допустимо, требования Sprint 5 выполнены).
+- Кэширование реализовано через простой in‑memory кэш с блокировкой потока, ключ = (серийный номер, nonce).
+
+### 9. Управление базой данных сертификатов
+
+#### Инициализация базы данных
 
 ```bash
 micropki db init --out-dir ./pki
 ```
 
-### Просмотр выпущенных сертификатов
-
-После того как вы выпустили несколько сертификатов (корневой, промежуточный, конечные), можно просмотреть их список.
+#### Просмотр списка сертификатов
 
 ```bash
-# Список всех сертификатов в виде таблицы
 micropki ca list-certs
-
-# Фильтрация по статусу (valid, revoked, expired)
 micropki ca list-certs --status valid
-
-# Вывод в формате JSON или CSV
 micropki ca list-certs --format json
 micropki ca list-certs --format csv
 ```
 
-### Просмотр конкретного сертификата по серийному номеру
+#### Просмотр конкретного сертификата по серийному номеру
 
 ```bash
 micropki ca show-cert 0x6521745cca871a45325873c792719
 ```
 
-## HTTP репозиторий
+### 10. HTTP репозиторий
 
-MicroPKI включает простой HTTP‑сервер для получения сертификатов, CRL и информации о состоянии.
-
-### Запуск сервера
+#### Запуск сервера
 
 ```bash
 micropki repo serve --host 127.0.0.1 --port 8080 --out-dir ./pki
 ```
 
-Сервер будет работать до нажатия `Ctrl+C`. Все запросы логируются в консоль (или в файл, если указан `--log-file`).
-
-### Примеры запросов
+#### Примеры запросов
 
 ```bash
 # Получить сертификат по серийному номеру
@@ -300,7 +294,7 @@ curl http://127.0.0.1:8080/ca/root
 # Получить промежуточный сертификат
 curl http://127.0.0.1:8080/ca/intermediate
 
-# Получить CRL промежуточного CA (по умолчанию)
+# Получить CRL (по умолчанию intermediate)
 curl http://127.0.0.1:8080/crl
 
 # Получить CRL корневого CA
@@ -310,19 +304,16 @@ curl http://127.0.0.1:8080/crl?ca=root
 curl http://127.0.0.1:8080/crl/root.crl
 ```
 
-### Примечания
-
-- Серийный номер можно указывать как с префиксом `0x`, так и без него.
-- Сервер возвращает PEM‑кодированные сертификаты с Content‑Type `application/x-pem-file`, а CRL — с `application/pkix-crl`.
-- Для удобства тестирования добавлены CORS‑заголовки (`Access-Control-Allow-Origin: *`).
-
 ## Запуск тестов
 
 ```bash
-pip install pytest
+pip install -e .[test]   # или просто pip install pytest
 pytest tests/ -v
 ```
-Все тесты (включая тесты отзыва и CRL) должны проходить успешно.
+
+Все тесты (включая OCSP) должны проходить успешно. Для OCSP требуется наличие OpenSSL в `PATH`.
+
+
 
 ## Параметры команд
 
@@ -439,4 +430,11 @@ micropki repo status
 - Ключи конечных сущностей сохраняются незашифрованными с правами `600`. Будьте внимательны с их хранением.
 - Парольные фразы не выводятся в логах.
 - На Unix-системах для директории `private` устанавливаются права `700`.
-- CRL подписываются тем же ключом, что и соответствующий CA, что гарантирует их подлинность.
+- OCSP-сертификат используется для подписи ответов, его приватный ключ хранится **незашифрованным** (требование автоматического запуска). Убедитесь в безопасности файловой системы.
+
+## Известные ограничения
+
+- OCSP-ответчик возвращает `404 Not Found` для неизвестных сертификатов вместо `unknown` (допустимо, RFC не требует строгого поведения).
+- Кэширование OCSP не учитывает изменения статуса до истечения TTL (при необходимости можно обновить CRL/OCSP вручную).
+- Delta‑CRL не реализованы (только полные CRL).
+- AIA расширения в сертификатах не добавляются (опционально).

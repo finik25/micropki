@@ -6,6 +6,7 @@ from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
 from cryptography.hazmat.backends import default_backend
+from cryptography.x509.oid import ObjectIdentifier
 
 def parse_dn(dn_string):
     dn_string = dn_string.strip()
@@ -230,3 +231,81 @@ def create_self_signed_cert(subject_dn, private_key, validity_days, key_type, se
         backend=default_backend()
     )
     return certificate
+
+def apply_template(template_name, public_key, san_list):
+    if template_name not in ('server', 'client', 'code_signing', 'ocsp_signer'):
+        raise ValueError(f"Unknown template: {template_name}")
+
+    extensions = []
+    basic = x509.BasicConstraints(ca=False, path_length=None)
+    extensions.append(x509.Extension(
+        oid=x509.oid.ExtensionOID.BASIC_CONSTRAINTS,
+        critical=True,
+        value=basic
+    ))
+
+    # Initialize variables
+    key_usage = None
+    ext_key_usage = None
+
+    if template_name == 'server':
+        key_usage = x509.KeyUsage(
+            digital_signature=True, content_commitment=False, key_encipherment=True,
+            data_encipherment=False, key_agreement=False, key_cert_sign=False,
+            crl_sign=False, encipher_only=False, decipher_only=False
+        )
+        ext_key_usage = x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH])
+        if not any(isinstance(san, (x509.DNSName, x509.IPAddress)) for san in san_list):
+            raise ValueError("Server certificate must have at least one DNS or IP SAN")
+
+    elif template_name == 'client':
+        key_usage = x509.KeyUsage(
+            digital_signature=True, content_commitment=False, key_encipherment=False,
+            data_encipherment=False, key_agreement=True, key_cert_sign=False,
+            crl_sign=False, encipher_only=False, decipher_only=False
+        )
+        ext_key_usage = x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH])
+
+    elif template_name == 'code_signing':
+        key_usage = x509.KeyUsage(
+            digital_signature=True, content_commitment=False, key_encipherment=False,
+            data_encipherment=False, key_agreement=False, key_cert_sign=False,
+            crl_sign=False, encipher_only=False, decipher_only=False
+        )
+        ext_key_usage = x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CODE_SIGNING])
+        for san in san_list:
+            if not isinstance(san, (x509.DNSName, x509.UniformResourceIdentifier)):
+                raise ValueError("Code signing certificate only allows DNS or URI SANs")
+
+    elif template_name == 'ocsp_signer':
+        key_usage = x509.KeyUsage(
+            digital_signature=True, content_commitment=False, key_encipherment=False,
+            data_encipherment=False, key_agreement=False, key_cert_sign=False,
+            crl_sign=False, encipher_only=False, decipher_only=False
+        )
+        ocsp_signing_oid = ObjectIdentifier("1.3.6.1.5.5.7.3.9")
+        ext_key_usage = x509.ExtendedKeyUsage([ocsp_signing_oid])
+        # SAN optional – no validation
+
+    # Add extensions if they were set
+    if key_usage is not None:
+        extensions.append(x509.Extension(
+            oid=x509.oid.ExtensionOID.KEY_USAGE,
+            critical=True,
+            value=key_usage
+        ))
+    if ext_key_usage is not None:
+        extensions.append(x509.Extension(
+            oid=x509.oid.ExtensionOID.EXTENDED_KEY_USAGE,
+            critical=False,
+            value=ext_key_usage
+        ))
+
+    if san_list:
+        extensions.append(x509.Extension(
+            oid=x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME,
+            critical=False,
+            value=x509.SubjectAlternativeName(san_list)
+        ))
+
+    return extensions

@@ -41,13 +41,14 @@ def generate_crl(db_path, ca_cert_path, ca_key_path, ca_pass_file, out_file,
         rev_date = datetime.datetime.fromisoformat(r['revocation_date'])
         builder = x509.RevokedCertificateBuilder().serial_number(serial).revocation_date(rev_date)
         reason_str = r.get('revocation_reason')
-        if reason_str and reason_str in REASON_CODES:
-            reason_code = REASON_CODES[reason_str]
-            # Добавляем расширение CRLReason
-            builder = builder.add_extension(
-                x509.CRLReason(x509.ReasonFlags(reason_code)),
-                critical=False
-            )
+        if reason_str:
+            # Получаем соответствующий атрибут ReasonFlags по имени строки
+            reason_flag = getattr(x509.ReasonFlags, reason_str, None)
+            if reason_flag is not None:
+                builder = builder.add_extension(
+                    x509.CRLReason(reason_flag),
+                    critical=False
+                )
         revoked_list.append(builder.build())
 
     # 4. Получаем следующий номер CRL
