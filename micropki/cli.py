@@ -45,6 +45,8 @@ def main():
     int_parser.add_argument('--log-format', choices=['text', 'json'], default='text')
     int_parser.add_argument('--force', action='store_true')
     int_parser.add_argument('--pki-dir', default='./pki', help='PKI root directory (for database)')
+    int_parser.add_argument('--crl-url', action='append', help='CRL Distribution Point URL (can be multiple)')
+    int_parser.add_argument('--ocsp-url', help='OCSP responder URL for AIA extension')
 
     # ca issue-cert
     cert_parser = ca_subparsers.add_parser('issue-cert', help='Issue an end-entity certificate')
@@ -61,6 +63,8 @@ def main():
     cert_parser.add_argument('--csr', help='External CSR file (PEM). If provided, --subject is ignored and no private key is saved.')
     cert_parser.add_argument('--pki-dir', default='./pki', help='PKI root directory (for database)')
     cert_parser.add_argument('--force', action='store_true', help='Overwrite existing output files')
+    cert_parser.add_argument('--crl-url', action='append', help='CRL Distribution Point URL (can be multiple)')
+    cert_parser.add_argument('--ocsp-url', help='OCSP responder URL for AIA extension')
 
     # ca issue-ocsp-cert
     ocsp_cert_parser = ca_subparsers.add_parser('issue-ocsp-cert', help='Issue OCSP signer certificate')
@@ -77,6 +81,44 @@ def main():
     ocsp_cert_parser.add_argument('--log-file')
     ocsp_cert_parser.add_argument('--log-format', choices=['text', 'json'], default='text')
     ocsp_cert_parser.add_argument('--force', action='store_true')
+
+    # client
+    client_parser = subparsers.add_parser('client', help='Client tools')
+    client_subparsers = client_parser.add_subparsers(dest='client_command', required=True)
+
+    # client gen-csr
+    gen_csr_parser = client_subparsers.add_parser('gen-csr', help='Generate private key and CSR')
+    gen_csr_parser.add_argument('--subject', required=True)
+    gen_csr_parser.add_argument('--key-type', choices=['rsa', 'ecc'], default='rsa')
+    gen_csr_parser.add_argument('--key-size', type=int, default=2048, help='RSA: 2048/4096, ECC: 256/384')
+    gen_csr_parser.add_argument('--san', action='append', help='SAN entry (dns:, ip:, email:, uri:)')
+    gen_csr_parser.add_argument('--out-key', default='key.pem', help='Output private key file')
+    gen_csr_parser.add_argument('--out-csr', default='request.csr.pem', help='Output CSR file')
+    gen_csr_parser.add_argument('--force', action='store_true', help='Overwrite existing files')
+
+    # client request-cert
+    req_cert_parser = client_subparsers.add_parser('request-cert', help='Submit CSR to CA and get certificate')
+    req_cert_parser.add_argument('--csr', required=True, help='CSR file')
+    req_cert_parser.add_argument('--template', required=True, choices=['server', 'client', 'code_signing'])
+    req_cert_parser.add_argument('--ca-url', required=True, help='Repository base URL (e.g., http://localhost:8080)')
+    req_cert_parser.add_argument('--out-cert', default='cert.pem', help='Output certificate file')
+    req_cert_parser.add_argument('--force', action='store_true', help='Overwrite existing certificate')
+
+    # client validate (заглушка)
+    validate_parser = client_subparsers.add_parser('validate', help='Validate certificate chain')
+    validate_parser.add_argument('--cert', required=True)
+    validate_parser.add_argument('--untrusted', action='append', help='Intermediate certificate file')
+    validate_parser.add_argument('--trusted', default='./pki/certs/ca.cert.pem', help='Root CA certificate file')
+    validate_parser.add_argument('--crl', help='CRL file or URL')
+    validate_parser.add_argument('--ocsp', action='store_true', help='Perform OCSP check')
+    validate_parser.add_argument('--mode', choices=['chain', 'full'], default='full')
+
+    # client check-status (заглушка)
+    check_parser = client_subparsers.add_parser('check-status', help='Check revocation status')
+    check_parser.add_argument('--cert', required=True)
+    check_parser.add_argument('--ca-cert', required=True, help='Issuer CA certificate')
+    check_parser.add_argument('--crl', help='CRL file or URL')
+    check_parser.add_argument('--ocsp-url', help='OCSP responder URL (overrides AIA)')
 
     # ca revoke
     revoke_parser = ca_subparsers.add_parser('revoke', help='Revoke a certificate')
@@ -152,6 +194,11 @@ def main():
     repo_serve.add_argument('--out-dir', default=None, help='PKI root directory')
     repo_serve.add_argument('--log-file', help='Log file for HTTP requests')
     repo_serve.add_argument('--log-format', choices=['text', 'json'], default='text')
+    repo_serve.add_argument('--ca-cert', help='CA certificate file for online signing')
+    repo_serve.add_argument('--ca-key', help='CA private key file for online signing')
+    repo_serve.add_argument('--ca-pass-file', help='Passphrase file for CA key')
+    repo_serve.add_argument('--crl-url', action='append', help='Default CRL URL for issued certificates')
+    repo_serve.add_argument('--ocsp-url', help='Default OCSP URL for issued certificates')
 
     repo_status = repo_subparsers.add_parser('status', help='Check if repository server is running')
     repo_status.add_argument('--host', default=None, help='Server host')
@@ -238,7 +285,9 @@ def main():
                     csr_path=args.csr,
                     pki_dir=args.pki_dir,
                     log_format=args.log_format,
-                    force=args.force
+                    force=args.force,
+                    crl_urls=args.crl_url,
+                    ocsp_url=args.ocsp_url
                 )
                 print("Certificate issued successfully.")
 
@@ -267,7 +316,9 @@ def main():
                     log_file=args.log_file,
                     force=args.force,
                     pki_dir=args.pki_dir,
-                    log_format=args.log_format
+                    log_format=args.log_format,
+                    crl_urls=args.crl_url,
+                    ocsp_url=args.ocsp_url
                 )
                 print("Intermediate CA created successfully.")
             except Exception as e:
@@ -471,7 +522,16 @@ def main():
             port = args.port if args.port is not None else cfg['port']
             out_dir = args.out_dir if args.out_dir is not None else cfg['pki_dir']
             from .repository import create_app
-            app = create_app(out_dir, args.log_file, log_format=args.log_format)
+            app = create_app(
+                out_dir,
+                args.log_file,
+                log_format=args.log_format,
+                ca_cert_path=args.ca_cert,
+                ca_key_path=args.ca_key,
+                ca_pass_file=args.ca_pass_file,
+                crl_urls=args.crl_url,
+                ocsp_url=args.ocsp_url
+            )
             app.run(host=host, port=port, debug=False)
         elif args.repo_command == 'status':
             host = args.host if args.host is not None else cfg['host']
@@ -498,6 +558,75 @@ def main():
                 log_format=args.log_format
             )
             app.run(host=args.host, port=args.port, debug=False)
+
+
+    elif args.command == 'client':
+        from . import client
+        if args.client_command == 'gen-csr':
+            try:
+                key_path, csr_path = client.generate_csr(
+                    subject=args.subject,
+                    key_type=args.key_type,
+                    key_size=args.key_size,
+                    san_list=args.san or [],
+                    out_key=args.out_key,
+                    out_csr=args.out_csr,
+                    force=args.force
+                )
+                print(f"Private key saved to {key_path}")
+                print(f"CSR saved to {csr_path}")
+            except Exception as e:
+                sys.stderr.write(f"Error: {e}\n")
+                sys.exit(1)
+        elif args.client_command == 'request-cert':
+            try:
+                cert_path = client.request_cert(
+                    csr_path=args.csr,
+                    template=args.template,
+                    ca_url=args.ca_url,
+                    out_cert=args.out_cert,
+                    force=args.force
+                )
+                print(f"Certificate saved to {cert_path}")
+            except Exception as e:
+                sys.stderr.write(f"Error: {e}\n")
+                sys.exit(1)
+        elif args.client_command == 'validate':
+            try:
+                result = client.validate_cert(
+                    cert_path=args.cert,
+                    intermediates=args.untrusted,
+                    trust_store=args.trusted,
+                    crl_source=args.crl,
+                    ocsp_source=args.ocsp_url if args.ocsp else None,
+                    mode=args.mode
+                )
+                if result['valid']:
+                    print(f"[OK] {result['message']}")
+                else:
+                    sys.stderr.write(f"[FAIL] {result['message']}\n")
+                    sys.exit(1)
+            except Exception as e:
+                sys.stderr.write(f"Error: {e}\n")
+                sys.exit(1)
+        elif args.client_command == 'check-status':
+            try:
+                status = client.check_status_cli(
+                    cert_path=args.cert,
+                    ca_cert_path=args.ca_cert,
+                    crl_source=args.crl,
+                    ocsp_url=args.ocsp_url
+                )
+                print(f"Status: {status['status']}")
+                if status.get('reason'):
+                    print(f"Reason: {status['reason']}")
+                if status.get('revocation_time'):
+                    print(f"Revocation time: {status['revocation_time']}")
+                if status['status'] != 'good':
+                    sys.exit(1)
+            except Exception as e:
+                sys.stderr.write(f"Error: {e}\n")
+                sys.exit(1)
 
     else:
         parser.print_help()

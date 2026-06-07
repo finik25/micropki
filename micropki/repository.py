@@ -1,12 +1,15 @@
 import os
+import tempfile
 from pathlib import Path
 from flask import Flask, abort, request, Response
 import logging
 import json
 from datetime import datetime, timezone
-from . import database
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+
+from . import database, ca
 
 
 def find_cert_in_fs(certs_dir, serial_hex):
@@ -29,8 +32,17 @@ def find_cert_in_fs(certs_dir, serial_hex):
     return None
 
 
-def create_app(pki_dir, log_file=None, log_format='text'):
+def create_app(pki_dir, log_file=None, log_format='text',
+               ca_cert_path=None, ca_key_path=None, ca_pass_file=None,
+               crl_urls=None, ocsp_url=None):
     app = Flask(__name__)
+    app.config['PKI_DIR'] = pki_dir
+    app.config['CA_CERT_PATH'] = ca_cert_path
+    app.config['CA_KEY_PATH'] = ca_key_path
+    app.config['CA_PASS_FILE'] = ca_pass_file
+    app.config['CRL_URLS'] = crl_urls          # изменено
+    app.config['OCSP_URL'] = ocsp_url          # изменено
+
     db_path = Path(pki_dir) / 'micropki.db'
     certs_dir = Path(pki_dir) / 'certs'
 
@@ -140,6 +152,51 @@ def create_app(pki_dir, log_file=None, log_format='text'):
         response.headers['Cache-Control'] = 'max-age=3600'
         # ETag можно добавить, но не обязательно
         return response
+
+    @app.route('/request-cert', methods=['POST'])
+    def request_cert():
+        template = request.args.get('template')
+        if not template or template not in ('server', 'client', 'code_signing'):
+            abort(400, description="Missing or invalid template parameter")
+        csr_pem = request.data
+        if not csr_pem:
+            abort(400, description="Empty request body")
+        ca_cert_path = app.config.get('CA_CERT_PATH')
+        ca_key_path = app.config.get('CA_KEY_PATH')
+        ca_pass_file = app.config.get('CA_PASS_FILE')
+        if not all([ca_cert_path, ca_key_path, ca_pass_file]):
+            abort(503, description="CA not configured for online signing")
+        crl_urls = app.config.get('CRL_URLS')
+        ocsp_url = app.config.get('OCSP_URL')
+        with tempfile.NamedTemporaryFile(mode='wb', suffix='.csr', delete=False) as f:
+            f.write(csr_pem)
+            tmp_csr_path = f.name
+        try:
+            out_dir = Path(pki_dir) / 'certs'
+            out_dir.mkdir(exist_ok=True)
+            cert_path, _ = ca.issue_certificate(
+                ca_cert_path=ca_cert_path,
+                ca_key_path=ca_key_path,
+                ca_pass_file=ca_pass_file,
+                template=template,
+                subject=None,
+                san_list=[],
+                out_dir=str(out_dir),
+                validity_days=365,
+                csr_path=tmp_csr_path,
+                pki_dir=pki_dir,
+                force=True,
+                crl_urls=crl_urls,
+                ocsp_url=ocsp_url
+            )
+            with open(cert_path, 'rb') as f:
+                cert_pem = f.read()
+            return Response(cert_pem, status=201, mimetype='application/x-pem-file')
+        except Exception as e:
+            app.logger.error(f"Certificate issuance failed: {e}")
+            abort(500, description=str(e))
+        finally:
+            os.unlink(tmp_csr_path)
 
     @app.route('/crl/<ca>.crl')
     def get_crl_by_path(ca):

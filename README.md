@@ -6,16 +6,16 @@
 
 ## Возможности
 
-- Создание корневого (Root) и промежуточного (Intermediate) удостоверяющих центров
+- Корневой и промежуточный центры сертификации (RSA/ECC)
 - Выпуск сертификатов по шаблонам: `server`, `client`, `code_signing`, `ocsp_signer`
-- Поддержка Subject Alternative Names (SAN): dns, ip, email, uri
-- Проверка цепочки сертификатов
-- Отзыв сертификатов и генерация CRL (Certificate Revocation List) согласно RFC 5280
-- **OCSP-ответчик** (Online Certificate Status Protocol) с поддержкой nonce, кэшированием и полным логированием
-- HTTP репозиторий для выдачи сертификатов, CRL и OCSP-ответов
-- Шифрование приватных ключей CA (PKCS#8, AES-256)
-- Поддержка внешних CSR (опционально)
-- Логирование операций (текст/JSON)
+- Subject Alternative Names (DNS, IP, email, URI)
+- Проверка цепочки сертификатов (собственный валидатор RFC 5280)
+- Отзыв сертификатов и генерация CRL (Certificate Revocation List) с поддержкой причин
+- OCSP-ответчик (RFC 6960) с nonce и кэшированием
+- HTTP-репозиторий для выдачи сертификатов, CRL и OCSP-ответов
+- Полноценная база данных SQLite с уникальными серийными номерами
+- **Клиентские инструменты**: генерация CSR, запрос сертификата, проверка цепочки и статуса (OCSP/CRL fallback)
+- **Поддержка CDP (CRL Distribution Points) и AIA (Authority Information Access)** – автоматическое извлечение OCSP и CRL из сертификата
 
 ## Структура проекта
 
@@ -35,6 +35,8 @@ micropki/
 │   ├── ocsp.py            # Парсинг и формирование OCSP-запросов/ответов
 │   ├── ocsp_responder.py  # Flask‑приложение OCSP-ответчика с кэшированием
 │   ├── logger.py          # Настройка логирования
+│   ├── client.py          # Клиентские утилиты (gen-csr, request-cert, validate, check-status)
+│   ├── revocation_check.py# Извлечение AIA/CDP, OCSP- и CRL-клиенты
 │   └── config.py          # Конфигурация (YAML)
 ├── tests/                 # Модульные тесты (pytest)
 ├── requirements.txt
@@ -46,7 +48,7 @@ micropki/
 ## Требования
 
 - Python 3.8 или выше
-- Библиотеки: `cryptography>=42.0.0`, `asn1crypto>=1.5.0`, `Flask>=2.0`, `pytest>=6.0`, `pyyaml>=6.0`
+- Библиотеки: `cryptography>=42.0.0`, `asn1crypto>=1.5.0`, `Flask>=2.0`, `pytest>=6.0`, `pyyaml>=6.0`, `requests>=2.25.0`
 - OpenSSL (для проверки CRL и OCSP, опционально)
 
 ## Установка
@@ -118,16 +120,18 @@ micropki ca issue-intermediate `
     --out-dir ./pki `
     --validity-days 1825 `
     --pathlen 0 `
+    --crl-url "http://localhost:8080/crl?ca=intermediate" `
+    --ocsp-url "http://localhost:8081/ocsp" `
     --force
 ```
 
 Будут созданы:
 - `pki/private/intermediate.key.pem` (зашифрован)
-- `pki/certs/intermediate.cert.pem`
+- `pki/certs/intermediate.cert.pem` (содержит CDP и AIA расширения)
 
 ### 3. Выпуск конечных сертификатов (end-entity)
 
-#### Сертификат сервера (с DNS и IP SAN)
+#### Сертификат сервера (с DNS и IP SAN, с CDP/AIA)
 ```bash
 micropki ca issue-cert `
     --ca-cert ./pki/certs/intermediate.cert.pem `
@@ -138,11 +142,13 @@ micropki ca issue-cert `
     --san dns:example.com `
     --san dns:www.example.com `
     --san ip:192.168.1.10 `
+    --crl-url "http://localhost:8080/crl?ca=intermediate" `
+    --ocsp-url "http://localhost:8081/ocsp" `
     --out-dir ./certs `
     --validity-days 365 `
     --force
 ```
-Результат: `certs/example.com.cert.pem` и `certs/example.com.key.pem` (незашифрованный).
+Результат: `certs/example.com.cert.pem` и `certs/example.com.key.pem` (незашифрованный). Сертификат будет содержать CDP и AIA.
 
 #### Клиентский сертификат
 ```bash
@@ -193,13 +199,13 @@ micropki ca gen-crl --ca root --next-update 7 --ca-pass-file pass.txt --force
 
 CRL сохраняются в `pki/crl/` как `root.crl.pem` и `intermediate.crl.pem`.
 
-### 6. Проверка статуса отзыва
+### 6. Проверка статуса отзыва (через БД)
 
 ```bash
 micropki ca check-revoked 0x2A7F...
 ```
 
-### 7. Проверка цепочки сертификатов
+### 7. Проверка цепочки сертификатов (встроенная)
 
 ```bash
 micropki ca verify-chain `
@@ -246,11 +252,6 @@ openssl ocsp -issuer pki/certs/intermediate.cert.pem `
     -resp_text -no_nonce
 ```
 
-**Примечания:**
-- OCSP-ответчик поддерживает nonce (защита от повторов) и кэширование ответов с TTL (по умолчанию 60 секунд).
-- Для неизвестных сертификатов возвращается HTTP 404 (это допустимо, требования Sprint 5 выполнены).
-- Кэширование реализовано через простой in‑memory кэш с блокировкой потока, ключ = (серийный номер, nonce).
-
 ### 9. Управление базой данных сертификатов
 
 #### Инициализация базы данных
@@ -276,10 +277,17 @@ micropki ca show-cert 0x6521745cca871a45325873c792719
 
 ### 10. HTTP репозиторий
 
-#### Запуск сервера
+#### Запуск сервера (с поддержкой подписи и CDP/AIA)
 
 ```bash
-micropki repo serve --host 127.0.0.1 --port 8080 --out-dir ./pki
+micropki repo serve `
+    --host 127.0.0.1 --port 8080 `
+    --out-dir ./pki `
+    --ca-cert ./pki/certs/intermediate.cert.pem `
+    --ca-key ./pki/private/intermediate.key.pem `
+    --ca-pass-file int_pass.txt `
+    --crl-url "http://localhost:8080/crl?ca=intermediate" `
+    --ocsp-url "http://localhost:8081/ocsp"
 ```
 
 #### Примеры запросов
@@ -302,6 +310,43 @@ curl http://127.0.0.1:8080/crl?ca=root
 
 # Альтернативный путь
 curl http://127.0.0.1:8080/crl/root.crl
+
+# Отправить CSR на подпись (через клиентскую команду)
+micropki client request-cert --csr request.csr --template server --ca-url http://127.0.0.1:8080 --out-cert cert.pem
+```
+
+### 11. Клиентские инструменты (Sprint 6)
+
+#### Генерация ключа и CSR
+
+```bash
+micropki client gen-csr `
+    --subject "CN=app.example.com" `
+    --key-type rsa --key-size 2048 `
+    --san dns:app.example.com `
+    --out-key app.key --out-csr app.csr
+```
+
+#### Отправка CSR в репозиторий и получение сертификата
+
+```bash
+micropki client request-cert `
+    --csr app.csr --template server `
+    --ca-url http://127.0.0.1:8080 --out-cert app.cert
+```
+
+#### Проверка цепочки и статуса отзыва (OCSP/CRL fallback)
+
+```bash
+# Полная проверка (цепочка + отзыв)
+micropki client validate `
+    --cert app.cert `
+    --trusted pki/certs/ca.cert.pem `
+    --untrusted pki/certs/intermediate.cert.pem `
+    --mode full
+
+# Только статус отзыва (OCSP → CRL fallback)
+micropki client check-status --cert app.cert --ca-cert pki/certs/intermediate.cert.pem
 ```
 
 ## Запуск тестов
@@ -312,8 +357,6 @@ pytest tests/ -v
 ```
 
 Все тесты (включая OCSP) должны проходить успешно. Для OCSP требуется наличие OpenSSL в `PATH`.
-
-
 
 ## Параметры команд
 
@@ -330,7 +373,7 @@ pytest tests/ -v
 | `--log-file` | Путь к файлу лога (если не указан – логи в stderr) | `./logs/ca-init.log` |
 | `--force` | Перезаписывать существующие файлы | `--force` |
 
-### `ca issue-intermediate` (Sprint 2)
+### `ca issue-intermediate` (Sprint 2 + Sprint 6 CDP/AIA)
 
 | Аргумент | Описание | Пример |
 |----------|----------|--------|
@@ -344,10 +387,12 @@ pytest tests/ -v
 | `--out-dir` | Директория для вывода (по умолчанию `./pki`) | `./pki` |
 | `--validity-days` | Срок действия сертификата (по умолчанию 1825) | `1825` |
 | `--pathlen` | Ограничение длины цепочки (по умолчанию `0`) | `0` |
+| `--crl-url` | **CRL Distribution Point URL** (можно указать несколько) | `--crl-url "http://localhost:8080/crl?ca=intermediate"` |
+| `--ocsp-url` | **OCSP responder URL** для AIA расширения | `--ocsp-url "http://localhost:8081/ocsp"` |
 | `--log-file` | Путь к файлу лога | `./logs/intermediate.log` |
 | `--force` | Перезаписывать существующие файлы | `--force` |
 
-### `ca issue-cert` (Sprint 2)
+### `ca issue-cert` (Sprint 2 + Sprint 6 CDP/AIA)
 
 | Аргумент | Описание | Пример |
 |----------|----------|--------|
@@ -358,6 +403,8 @@ pytest tests/ -v
 | `--subject` | Distinguished Name для конечного сертификата | `CN=example.com` |
 | `--san` | Subject Alternative Name (можно указать несколько) | `dns:example.com` `ip:192.168.1.1` |
 | `--csr` | (Опционально) Внешний CSR в формате PEM | `./request.csr` |
+| `--crl-url` | **CRL Distribution Point URL** (можно указать несколько) | `--crl-url "http://localhost:8080/crl?ca=intermediate"` |
+| `--ocsp-url` | **OCSP responder URL** для AIA расширения | `--ocsp-url "http://localhost:8081/ocsp"` |
 | `--out-dir` | Директория для вывода (по умолчанию `./pki/certs`) | `./certs` |
 | `--validity-days` | Срок действия сертификата (по умолчанию 365) | `365` |
 | `--log-file` | Путь к файлу лога | `./logs/issue.log` |
@@ -405,6 +452,63 @@ pytest tests/ -v
 |----------|----------|--------|
 | `--cert` | Путь к сертификату для проверки (только самоподписанный) | `./pki/certs/ca.cert.pem` |
 
+### `client gen-csr` (Sprint 6)
+
+| Аргумент | Описание | Пример |
+|----------|----------|--------|
+| `--subject` | Distinguished Name | `CN=client.example.com` |
+| `--key-type` | `rsa` или `ecc` (по умолчанию `rsa`) | `ecc` |
+| `--key-size` | Размер ключа: RSA 2048/4096, ECC 256/384 | `2048` |
+| `--san` | Subject Alternative Name (можно несколько) | `dns:example.com` `ip:10.0.0.1` |
+| `--out-key` | Файл для сохранения приватного ключа | `./client.key` |
+| `--out-csr` | Файл для сохранения CSR | `./client.csr` |
+| `--force` | Перезаписывать существующие файлы | `--force` |
+
+### `client request-cert` (Sprint 6)
+
+| Аргумент | Описание | Пример |
+|----------|----------|--------|
+| `--csr` | Путь к CSR файлу | `./client.csr` |
+| `--template` | Шаблон сертификата (`server`, `client`, `code_signing`) | `server` |
+| `--ca-url` | Базовый URL репозитория | `http://localhost:8080` |
+| `--out-cert` | Файл для сохранения сертификата | `./client.cert` |
+| `--force` | Перезаписывать существующий файл | `--force` |
+
+### `client validate` (Sprint 6)
+
+| Аргумент | Описание | Пример |
+|----------|----------|--------|
+| `--cert` | Путь к проверяемому сертификату | `./client.cert` |
+| `--untrusted` | Путь к промежуточному сертификату (можно несколько) | `--untrusted intermediate.pem` |
+| `--trusted` | Путь к корневому сертификату (по умолч. `./pki/certs/ca.cert.pem`) | `./root.pem` |
+| `--crl` | CRL файл или URL (опционально) | `--crl http://localhost:8080/crl` |
+| `--ocsp` | Выполнить OCSP-проверку | `--ocsp` |
+| `--mode` | `chain` (только цепочка) или `full` (с отзывом) | `full` |
+
+### `client check-status` (Sprint 6)
+
+| Аргумент | Описание | Пример |
+|----------|----------|--------|
+| `--cert` | Путь к сертификату | `./client.cert` |
+| `--ca-cert` | Путь к сертификату издателя (CA) | `./pki/certs/intermediate.cert.pem` |
+| `--crl` | CRL файл или URL (опционально) | `--crl http://localhost:8080/crl` |
+| `--ocsp-url` | OCSP URL (переопределяет AIA) | `--ocsp-url http://localhost:8081/ocsp` |
+
+### `repo serve` (Sprint 3 + Sprint 6)
+
+| Аргумент | Описание | Пример |
+|----------|----------|--------|
+| `--host` | Адрес для привязки | `127.0.0.1` |
+| `--port` | TCP порт | `8080` |
+| `--out-dir` | Корневая директория PKI (по умолч. `./pki`) | `./pki` |
+| `--log-file` | Файл лога HTTP запросов | `./logs/repo.log` |
+| `--log-format` | `text` или `json` | `json` |
+| `--ca-cert` | Сертификат CA для онлайн-подписи | `./pki/certs/intermediate.cert.pem` |
+| `--ca-key` | Приватный ключ CA | `./pki/private/intermediate.key.pem` |
+| `--ca-pass-file` | Файл с парольной фразой для ключа CA | `./int_pass.txt` |
+| `--crl-url` | **CRL URL по умолчанию** (добавляется в сертификаты) | `http://localhost:8080/crl?ca=intermediate` |
+| `--ocsp-url` | **OCSP URL по умолчанию** (AIA) | `http://localhost:8081/ocsp` |
+
 ## Конфигурационный файл
 
 MicroPKI поддерживает файл `micropki.conf` в формате YAML. Пример:
@@ -437,4 +541,3 @@ micropki repo status
 - OCSP-ответчик возвращает `404 Not Found` для неизвестных сертификатов вместо `unknown` (допустимо, RFC не требует строгого поведения).
 - Кэширование OCSP не учитывает изменения статуса до истечения TTL (при необходимости можно обновить CRL/OCSP вручную).
 - Delta‑CRL не реализованы (только полные CRL).
-- AIA расширения в сертификатах не добавляются (опционально).

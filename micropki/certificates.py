@@ -2,11 +2,16 @@ import os
 import datetime
 import ipaddress
 from cryptography import x509
-from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID, ObjectIdentifier, AuthorityInformationAccessOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
 from cryptography.hazmat.backends import default_backend
-from cryptography.x509.oid import ObjectIdentifier
+from cryptography.x509 import (
+    AuthorityInformationAccess, AccessDescription,
+    CRLDistributionPoints, DistributionPoint,
+    UniformResourceIdentifier
+)
+
 
 def parse_dn(dn_string):
     dn_string = dn_string.strip()
@@ -37,9 +42,10 @@ def parse_dn(dn_string):
             attributes.append(x509.NameAttribute(oid, value))
     return x509.Name(attributes)
 
+
 def generate_serial_number():
-    """Legacy random serial generator (152-bit)."""
     return int.from_bytes(os.urandom(19), byteorder='big')
+
 
 def parse_san(san_strings):
     san_list = []
@@ -64,9 +70,38 @@ def parse_san(san_strings):
             raise ValueError(f"Unsupported SAN type: {typ}")
     return san_list
 
-def apply_template(template_name, public_key, san_list):
-    if template_name not in ('server', 'client', 'code_signing'):
+
+def build_cdp_extension(crl_urls):
+    """Build CRL Distribution Points extension from list of URLs."""
+    if not crl_urls:
+        return None
+    points = []
+    for url in crl_urls:
+        point = DistributionPoint(
+            full_name=[UniformResourceIdentifier(url)],
+            relative_name=None,
+            reasons=None,
+            crl_issuer=None
+        )
+        points.append(point)
+    return CRLDistributionPoints(points)
+
+
+def build_aia_extension(ocsp_url):
+    """Build Authority Information Access extension with OCSP responder URL."""
+    if not ocsp_url:
+        return None
+    access_desc = AccessDescription(
+        access_method=AuthorityInformationAccessOID.OCSP,
+        access_location=UniformResourceIdentifier(ocsp_url)
+    )
+    return AuthorityInformationAccess([access_desc])
+
+
+def apply_template(template_name, public_key, san_list, crl_urls=None, ocsp_url=None):
+    if template_name not in ('server', 'client', 'code_signing', 'ocsp_signer'):
         raise ValueError(f"Unknown template: {template_name}")
+
     extensions = []
     basic = x509.BasicConstraints(ca=False, path_length=None)
     extensions.append(x509.Extension(
@@ -74,6 +109,10 @@ def apply_template(template_name, public_key, san_list):
         critical=True,
         value=basic
     ))
+
+    key_usage = None
+    ext_key_usage = None
+
     if template_name == 'server':
         key_usage = x509.KeyUsage(
             digital_signature=True, content_commitment=False, key_encipherment=True,
@@ -83,6 +122,7 @@ def apply_template(template_name, public_key, san_list):
         ext_key_usage = x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH])
         if not any(isinstance(san, (x509.DNSName, x509.IPAddress)) for san in san_list):
             raise ValueError("Server certificate must have at least one DNS or IP SAN")
+
     elif template_name == 'client':
         key_usage = x509.KeyUsage(
             digital_signature=True, content_commitment=False, key_encipherment=False,
@@ -90,7 +130,8 @@ def apply_template(template_name, public_key, san_list):
             crl_sign=False, encipher_only=False, decipher_only=False
         )
         ext_key_usage = x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH])
-    else:  # code_signing
+
+    elif template_name == 'code_signing':
         key_usage = x509.KeyUsage(
             digital_signature=True, content_commitment=False, key_encipherment=False,
             data_encipherment=False, key_agreement=False, key_cert_sign=False,
@@ -100,23 +141,55 @@ def apply_template(template_name, public_key, san_list):
         for san in san_list:
             if not isinstance(san, (x509.DNSName, x509.UniformResourceIdentifier)):
                 raise ValueError("Code signing certificate only allows DNS or URI SANs")
-    extensions.append(x509.Extension(
-        oid=x509.oid.ExtensionOID.KEY_USAGE,
-        critical=True,
-        value=key_usage
-    ))
-    extensions.append(x509.Extension(
-        oid=x509.oid.ExtensionOID.EXTENDED_KEY_USAGE,
-        critical=False,
-        value=ext_key_usage
-    ))
+
+    elif template_name == 'ocsp_signer':
+        key_usage = x509.KeyUsage(
+            digital_signature=True, content_commitment=False, key_encipherment=False,
+            data_encipherment=False, key_agreement=False, key_cert_sign=False,
+            crl_sign=False, encipher_only=False, decipher_only=False
+        )
+        ocsp_signing_oid = ObjectIdentifier("1.3.6.1.5.5.7.3.9")
+        ext_key_usage = x509.ExtendedKeyUsage([ocsp_signing_oid])
+
+    if key_usage is not None:
+        extensions.append(x509.Extension(
+            oid=x509.oid.ExtensionOID.KEY_USAGE,
+            critical=True,
+            value=key_usage
+        ))
+    if ext_key_usage is not None:
+        extensions.append(x509.Extension(
+            oid=x509.oid.ExtensionOID.EXTENDED_KEY_USAGE,
+            critical=False,
+            value=ext_key_usage
+        ))
+
     if san_list:
         extensions.append(x509.Extension(
             oid=x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME,
             critical=False,
             value=x509.SubjectAlternativeName(san_list)
         ))
+
+    if crl_urls:
+        cdp_ext = build_cdp_extension(crl_urls)
+        if cdp_ext:
+            extensions.append(x509.Extension(
+                oid=x509.oid.ExtensionOID.CRL_DISTRIBUTION_POINTS,
+                critical=False,
+                value=cdp_ext
+            ))
+    if ocsp_url:
+        aia_ext = build_aia_extension(ocsp_url)
+        if aia_ext:
+            extensions.append(x509.Extension(
+                oid=x509.oid.ExtensionOID.AUTHORITY_INFORMATION_ACCESS,
+                critical=False,
+                value=aia_ext
+            ))
+
     return extensions
+
 
 def create_csr(subject_dn, private_key, extensions=None):
     subject = parse_dn(subject_dn)
@@ -127,14 +200,15 @@ def create_csr(subject_dn, private_key, extensions=None):
     csr = builder.sign(private_key, hashes.SHA256(), default_backend())
     return csr
 
-def sign_csr(csr, ca_cert, ca_private_key, validity_days, template_name, san_strings=None, serial_number=None):
+
+def sign_csr(csr, ca_cert, ca_private_key, validity_days, template_name, san_strings=None,
+             serial_number=None, crl_urls=None, ocsp_url=None):
     san_list = parse_san(san_strings) if san_strings else []
     public_key = csr.public_key()
-    template_extensions = apply_template(template_name, public_key, san_list)
+    template_extensions = apply_template(template_name, public_key, san_list, crl_urls, ocsp_url)
     builder = x509.CertificateBuilder()
     builder = builder.subject_name(csr.subject)
     builder = builder.issuer_name(ca_cert.subject)
-    # Use provided serial or generate random
     serial = serial_number if serial_number is not None else generate_serial_number()
     builder = builder.serial_number(serial)
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -153,7 +227,9 @@ def sign_csr(csr, ca_cert, ca_private_key, validity_days, template_name, san_str
     cert = builder.sign(ca_private_key, signature_hash, default_backend())
     return cert
 
-def create_intermediate_certificate(subject_dn, public_key, ca_cert, ca_private_key, validity_days, pathlen=0, serial_number=None):
+
+def create_intermediate_certificate(subject_dn, public_key, ca_cert, ca_private_key, validity_days,
+                                    pathlen=0, serial_number=None, crl_urls=None, ocsp_url=None):
     builder = x509.CertificateBuilder()
     builder = builder.subject_name(parse_dn(subject_dn))
     builder = builder.issuer_name(ca_cert.subject)
@@ -175,6 +251,14 @@ def create_intermediate_certificate(subject_dn, public_key, ca_cert, ca_private_
         ),
         critical=True
     )
+    if crl_urls:
+        cdp_ext = build_cdp_extension(crl_urls)
+        if cdp_ext:
+            builder = builder.add_extension(cdp_ext, critical=False)
+    if ocsp_url:
+        aia_ext = build_aia_extension(ocsp_url)
+        if aia_ext:
+            builder = builder.add_extension(aia_ext, critical=False)
     ski = x509.SubjectKeyIdentifier.from_public_key(public_key)
     aki = x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(
         ca_cert.extensions.get_extension_for_oid(x509.oid.ExtensionOID.SUBJECT_KEY_IDENTIFIER).value
@@ -184,6 +268,7 @@ def create_intermediate_certificate(subject_dn, public_key, ca_cert, ca_private_
     signature_hash = hashes.SHA256() if isinstance(ca_private_key, rsa.RSAPrivateKey) else hashes.SHA384()
     cert = builder.sign(ca_private_key, signature_hash, default_backend())
     return cert
+
 
 def create_self_signed_cert(subject_dn, private_key, validity_days, key_type, serial_number=None):
     subject = parse_dn(subject_dn)
@@ -231,81 +316,3 @@ def create_self_signed_cert(subject_dn, private_key, validity_days, key_type, se
         backend=default_backend()
     )
     return certificate
-
-def apply_template(template_name, public_key, san_list):
-    if template_name not in ('server', 'client', 'code_signing', 'ocsp_signer'):
-        raise ValueError(f"Unknown template: {template_name}")
-
-    extensions = []
-    basic = x509.BasicConstraints(ca=False, path_length=None)
-    extensions.append(x509.Extension(
-        oid=x509.oid.ExtensionOID.BASIC_CONSTRAINTS,
-        critical=True,
-        value=basic
-    ))
-
-    # Initialize variables
-    key_usage = None
-    ext_key_usage = None
-
-    if template_name == 'server':
-        key_usage = x509.KeyUsage(
-            digital_signature=True, content_commitment=False, key_encipherment=True,
-            data_encipherment=False, key_agreement=False, key_cert_sign=False,
-            crl_sign=False, encipher_only=False, decipher_only=False
-        )
-        ext_key_usage = x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH])
-        if not any(isinstance(san, (x509.DNSName, x509.IPAddress)) for san in san_list):
-            raise ValueError("Server certificate must have at least one DNS or IP SAN")
-
-    elif template_name == 'client':
-        key_usage = x509.KeyUsage(
-            digital_signature=True, content_commitment=False, key_encipherment=False,
-            data_encipherment=False, key_agreement=True, key_cert_sign=False,
-            crl_sign=False, encipher_only=False, decipher_only=False
-        )
-        ext_key_usage = x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH])
-
-    elif template_name == 'code_signing':
-        key_usage = x509.KeyUsage(
-            digital_signature=True, content_commitment=False, key_encipherment=False,
-            data_encipherment=False, key_agreement=False, key_cert_sign=False,
-            crl_sign=False, encipher_only=False, decipher_only=False
-        )
-        ext_key_usage = x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CODE_SIGNING])
-        for san in san_list:
-            if not isinstance(san, (x509.DNSName, x509.UniformResourceIdentifier)):
-                raise ValueError("Code signing certificate only allows DNS or URI SANs")
-
-    elif template_name == 'ocsp_signer':
-        key_usage = x509.KeyUsage(
-            digital_signature=True, content_commitment=False, key_encipherment=False,
-            data_encipherment=False, key_agreement=False, key_cert_sign=False,
-            crl_sign=False, encipher_only=False, decipher_only=False
-        )
-        ocsp_signing_oid = ObjectIdentifier("1.3.6.1.5.5.7.3.9")
-        ext_key_usage = x509.ExtendedKeyUsage([ocsp_signing_oid])
-        # SAN optional – no validation
-
-    # Add extensions if they were set
-    if key_usage is not None:
-        extensions.append(x509.Extension(
-            oid=x509.oid.ExtensionOID.KEY_USAGE,
-            critical=True,
-            value=key_usage
-        ))
-    if ext_key_usage is not None:
-        extensions.append(x509.Extension(
-            oid=x509.oid.ExtensionOID.EXTENDED_KEY_USAGE,
-            critical=False,
-            value=ext_key_usage
-        ))
-
-    if san_list:
-        extensions.append(x509.Extension(
-            oid=x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME,
-            critical=False,
-            value=x509.SubjectAlternativeName(san_list)
-        ))
-
-    return extensions

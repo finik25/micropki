@@ -2,6 +2,7 @@ import os
 import datetime
 from pathlib import Path
 from cryptography import x509
+from cryptography.hazmat._oid import NameOID
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
 from cryptography.hazmat.backends import default_backend
@@ -79,10 +80,10 @@ def init_ca(subject, key_type, key_size, passphrase_file, out_dir, validity_days
 
 def create_intermediate_ca(root_cert_path, root_key_path, root_pass_file, subject, key_type, key_size,
                            passphrase_file, out_dir, validity_days, pathlen, log_file=None, force=False,
-                           pki_dir=None, log_format='text'):
+                           pki_dir=None, log_format='text', crl_urls=None, ocsp_url=None):
     logger = setup_logging(log_file, log_format=log_format)
 
-    # Load root CA
+    # Load root CA ( unchanged )
     with open(root_cert_path, 'rb') as f:
         root_cert = x509.load_pem_x509_certificate(f.read(), default_backend())
     with open(root_key_path, 'rb') as f:
@@ -103,7 +104,6 @@ def create_intermediate_ca(root_cert_path, root_key_path, root_pass_file, subjec
         private_key = crypto_utils.generate_ecc_key()
     logger.info("Key generation completed.")
 
-    # Determine paths
     out_path = Path(out_dir)
     private_dir = out_path / 'private'
     certs_dir = out_path / 'certs'
@@ -112,19 +112,16 @@ def create_intermediate_ca(root_cert_path, root_key_path, root_pass_file, subjec
     key_path = private_dir / 'intermediate.key.pem'
     cert_path = certs_dir / 'intermediate.cert.pem'
 
-    # Check for existing files BEFORE any DB operation
     if not force:
         if key_path.exists():
             raise FileExistsError(f"Intermediate key already exists: {key_path}. Use --force to overwrite.")
         if cert_path.exists():
             raise FileExistsError(f"Intermediate certificate already exists: {cert_path}. Use --force to overwrite.")
 
-    # Determine database path
     if pki_dir is None:
         pki_dir = out_dir
     db_path = Path(pki_dir) / 'micropki.db'
 
-    # Generate unique serial number if database exists
     serial_number = None
     if database.db_exists(str(db_path)):
         try:
@@ -135,18 +132,16 @@ def create_intermediate_ca(root_cert_path, root_key_path, root_pass_file, subjec
     else:
         logger.warning("Database not found, intermediate certificate serial will be random (not guaranteed unique)")
 
-    # Create intermediate certificate
     logger.info("Signing intermediate CSR with Root CA...")
     intermediate_cert = certificates.create_intermediate_certificate(
         subject, private_key.public_key(), root_cert, root_private_key, validity_days, pathlen,
-        serial_number=serial_number
+        serial_number=serial_number, crl_urls=crl_urls, ocsp_url=ocsp_url
     )
     logger.info("Intermediate certificate created.")
 
     cert_serial_hex = hex(intermediate_cert.serial_number)
     db_inserted = False
 
-    # Insert into database if exists
     if database.db_exists(str(db_path)):
         try:
             database.insert_certificate(str(db_path), intermediate_cert, root_cert.subject)
@@ -154,9 +149,8 @@ def create_intermediate_ca(root_cert_path, root_key_path, root_pass_file, subjec
             logger.info(f"Inserted intermediate certificate into database (serial={cert_serial_hex})")
         except Exception as e:
             logger.error(f"Failed to insert intermediate certificate into database: {e}")
-            raise  # abort operation
+            raise
 
-    # Save encrypted key and certificate
     private_dir.mkdir(exist_ok=True, parents=True)
     certs_dir.mkdir(exist_ok=True, parents=True)
 
@@ -176,7 +170,6 @@ def create_intermediate_ca(root_cert_path, root_key_path, root_pass_file, subjec
             logger.error(f"File write failed, database entry marked as revoked: {e}")
         raise
 
-    # Update policy.txt
     policy_path = out_path / 'policy.txt'
     with open(policy_path, 'a') as f:
         f.write("\n--- Intermediate CA ---\n")
@@ -193,10 +186,10 @@ def create_intermediate_ca(root_cert_path, root_key_path, root_pass_file, subjec
 
 def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject, san_list,
                       out_dir, validity_days, csr_path=None, log_file=None, pki_dir=None,
-                      log_format='text', force=False):
+                      log_format='text', force=False, crl_urls=None, ocsp_url=None):
     logger = setup_logging(log_file, log_format=log_format)
 
-    # Load CA
+    # Load CA ( unchanged )
     with open(ca_cert_path, 'rb') as f:
         ca_cert = x509.load_pem_x509_certificate(f.read(), default_backend())
     with open(ca_key_path, 'rb') as f:
@@ -214,12 +207,11 @@ def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject
     out_path = Path(out_dir)
     out_path.mkdir(exist_ok=True, parents=True)
 
-    # Determine output paths and subject early (for file existence check)
-    from cryptography.x509.oid import NameOID
     effective_subject = None
     cn = None
+    san_strings = san_list if san_list else []
+
     if csr_path:
-        # Load CSR to get subject
         with open(csr_path, 'rb') as f:
             csr_data = f.read()
         csr = x509.load_pem_x509_csr(csr_data, default_backend())
@@ -233,6 +225,25 @@ def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject
         cert_filename = f"{cn.replace(' ', '_').replace('*', 'wildcard')}.cert.pem"
         cert_path = out_path / cert_filename
         key_path = None
+
+        # Extract SAN from CSR
+        try:
+            san_ext = csr.extensions.get_extension_for_oid(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+            san_objects = san_ext.value
+            san_strings = []
+            for gn in san_objects:
+                if isinstance(gn, x509.DNSName):
+                    san_strings.append(f"dns:{gn.value}")
+                elif isinstance(gn, x509.IPAddress):
+                    san_strings.append(f"ip:{gn.value}")
+                elif isinstance(gn, x509.RFC822Name):
+                    san_strings.append(f"email:{gn.value}")
+                elif isinstance(gn, x509.UniformResourceIdentifier):
+                    san_strings.append(f"uri:{gn.value}")
+            logger.info(f"Extracted SANs from CSR: {san_strings}")
+        except x509.ExtensionNotFound:
+            logger.info("No SAN extension found in CSR")
+            san_strings = []
     else:
         if not subject:
             raise ValueError("Subject is required when CSR is not provided")
@@ -249,14 +260,14 @@ def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject
         cert_path = out_path / cert_filename
         key_path = out_path / key_filename
 
-    # Check for existing files before any DB or crypto operations
+    # Check existing files
     if not force:
         if cert_path.exists():
             raise FileExistsError(f"Certificate file already exists: {cert_path}. Use --force to overwrite.")
         if key_path and key_path.exists():
             raise FileExistsError(f"Private key file already exists: {key_path}. Use --force to overwrite.")
 
-    # Generate unique serial number if database exists
+    # Generate unique serial
     serial_number = None
     if db_available:
         try:
@@ -268,11 +279,9 @@ def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject
         logger.warning("Database not found, certificate serial will be random (not guaranteed unique)")
 
     if csr_path:
-        # Use external CSR (already loaded above)
-        cert = certificates.sign_csr(csr, ca_cert, ca_private_key, validity_days, template, san_list,
-                                     serial_number=serial_number)
+        cert = certificates.sign_csr(csr, ca_cert, ca_private_key, validity_days, template, san_strings,
+                                     serial_number=serial_number, crl_urls=crl_urls, ocsp_url=ocsp_url)
         cert_serial_hex = hex(cert.serial_number)
-
         db_inserted = False
         if db_available:
             try:
@@ -282,7 +291,6 @@ def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject
             except Exception as e:
                 logger.error(f"Failed to insert certificate into database: {e}")
                 raise
-
         try:
             with open(cert_path, 'wb') as f:
                 f.write(cert.public_bytes(serialization.Encoding.PEM))
@@ -292,19 +300,15 @@ def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject
             if db_inserted:
                 database.update_cert_status(str(db_path), cert_serial_hex, 'revoked', reason='issuance_failed')
             raise
-
         return cert_path, None
-
     else:
-        # Generate new key pair
         logger.info(f"Generating {template} private key...")
         ee_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
         logger.info("Key generation completed.")
         csr = certificates.create_csr(subject, ee_private_key, extensions=None)
-        cert = certificates.sign_csr(csr, ca_cert, ca_private_key, validity_days, template, san_list,
-                                     serial_number=serial_number)
+        cert = certificates.sign_csr(csr, ca_cert, ca_private_key, validity_days, template, san_strings,
+                                     serial_number=serial_number, crl_urls=crl_urls, ocsp_url=ocsp_url)
         cert_serial_hex = hex(cert.serial_number)
-
         db_inserted = False
         if db_available:
             try:
@@ -314,7 +318,6 @@ def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject
             except Exception as e:
                 logger.error(f"Failed to insert certificate into database: {e}")
                 raise
-
         try:
             with open(cert_path, 'wb') as f:
                 f.write(cert.public_bytes(serialization.Encoding.PEM))
@@ -329,14 +332,12 @@ def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject
             logger.info(f"Certificate saved to {cert_path}")
             logger.info(f"Private key (unencrypted) saved to {key_path}")
             logger.warning("End-entity private key stored unencrypted. Ensure proper file permissions.")
-            logger.info(f"Issued {template} certificate: serial={cert_serial_hex}, subject={subject}, SANs={san_list}")
+            logger.info(f"Issued {template} certificate: serial={cert_serial_hex}, subject={subject}, SANs={san_strings}")
         except Exception as e:
             if db_inserted:
                 database.update_cert_status(str(db_path), cert_serial_hex, 'revoked', reason='issuance_failed')
             raise
-
         return cert_path, key_path
-
 
 def verify_certificate(cert_path, subject_cert=None):
     from cryptography.hazmat.primitives.asymmetric import padding, ec
