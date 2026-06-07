@@ -316,3 +316,56 @@ def create_self_signed_cert(subject_dn, private_key, validity_days, key_type, se
         backend=default_backend()
     )
     return certificate
+
+
+# ========== Политики безопасности ==========
+from .config import POLICY_MAX_VALIDITY_DAYS, POLICY_MIN_KEY_SIZE, POLICY_FORBIDDEN_WILDCARD, POLICY_ALLOWED_SAN_TYPES
+
+def check_validity_period(cert_type: str, validity_days: int) -> None:
+    """Проверить, что срок действия не превышает максимум."""
+    max_days = POLICY_MAX_VALIDITY_DAYS.get(cert_type)
+    if max_days is None:
+        raise ValueError(f"Unknown certificate type: {cert_type}")
+    if validity_days > max_days:
+        raise ValueError(f"Validity period {validity_days} days exceeds maximum {max_days} days for {cert_type} certificate")
+
+def check_key_size(key_type: str, key_size: int, cert_type: str) -> None:
+    """Проверить, что размер ключа соответствует минимальным требованиям."""
+    if key_type == 'rsa':
+        min_size = POLICY_MIN_KEY_SIZE.get(f'rsa_{cert_type}')
+        if min_size is None:
+            min_size = POLICY_MIN_KEY_SIZE['rsa_end_entity']
+        if key_size < min_size:
+            raise ValueError(f"RSA key size {key_size} is below minimum {min_size} for {cert_type} certificate")
+    elif key_type == 'ecc':
+        min_size = POLICY_MIN_KEY_SIZE.get(f'ecc_{cert_type}')
+        if min_size is None:
+            min_size = POLICY_MIN_KEY_SIZE['ecc_end_entity']
+        if key_size < min_size:
+            raise ValueError(f"ECC key size {key_size} is below minimum {min_size} for {cert_type} certificate")
+    else:
+        raise ValueError(f"Unsupported key type: {key_type}")
+
+def check_san_types(template: str, san_list) -> None:
+    """
+    Проверить, что типы SAN соответствуют разрешённым для шаблона.
+    san_list – список объектов GeneralName (DNSName, IPAddress, RFC822Name, URI)
+    """
+    allowed = POLICY_ALLOWED_SAN_TYPES.get(template, set())
+    if not allowed:
+        return  # нет ограничений
+    for san in san_list:
+        if isinstance(san, x509.DNSName):
+            typ = 'dns'
+            if POLICY_FORBIDDEN_WILDCARD and '*' in san.value:
+                raise ValueError(f"Wildcard DNS name '{san.value}' is forbidden for {template} certificate")
+        elif isinstance(san, x509.IPAddress):
+            typ = 'ip'
+        elif isinstance(san, x509.RFC822Name):
+            typ = 'email'
+        elif isinstance(san, x509.UniformResourceIdentifier):
+            typ = 'uri'
+        else:
+            typ = 'unknown'
+        if typ not in allowed:
+            raise ValueError(f"SAN type '{typ}' is not allowed for {template} certificate. Allowed: {allowed}")

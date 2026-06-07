@@ -9,6 +9,8 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 from . import database, ocsp
 from .logger import setup_logging
+from .ratelimit import RateLimiter
+from .audit import get_audit_logger
 
 # Простой кэш с TTL
 class OCSPCache:
@@ -40,7 +42,8 @@ class OCSPCache:
 _cache = None
 
 def create_ocsp_app(db_path, responder_cert_path, responder_key_path, ca_cert_path,
-                    cache_ttl=60, log_file=None, log_format='text'):
+                    cache_ttl=60, log_file=None, log_format='text',
+                    rate_limit=0, rate_burst=10):
     global _cache
     if _cache is None:
         _cache = OCSPCache()
@@ -78,6 +81,17 @@ def create_ocsp_app(db_path, responder_cert_path, responder_key_path, ca_cert_pa
     for handler in logger.handlers:
         app.logger.addHandler(handler)
     app.logger.setLevel(logging.INFO)
+
+    limiter = RateLimiter(rate_limit, rate_burst)
+
+    @app.before_request
+    def check_rate_limit():
+        if rate_limit > 0:
+            client_ip = request.remote_addr
+            if not limiter.allow(client_ip):
+                app.logger.warning(f"Rate limit exceeded for {client_ip}")
+                return Response("Too Many Requests", status=429, headers={'Retry-After': '1'})
+        return None
 
     @app.route('/ocsp', methods=['POST'])
     def ocsp_endpoint():

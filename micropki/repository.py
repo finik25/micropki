@@ -8,12 +8,12 @@ from datetime import datetime, timezone
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
-
+from .ratelimit import RateLimiter
 from . import database, ca
+from .audit import get_audit_logger, init_audit
 
 
 def find_cert_in_fs(certs_dir, serial_hex):
-    """Search for a certificate by serial number in the certs directory."""
     try:
         serial_int = int(serial_hex, 16)
     except ValueError:
@@ -34,19 +34,26 @@ def find_cert_in_fs(certs_dir, serial_hex):
 
 def create_app(pki_dir, log_file=None, log_format='text',
                ca_cert_path=None, ca_key_path=None, ca_pass_file=None,
-               crl_urls=None, ocsp_url=None):
+               crl_urls=None, ocsp_url=None,
+               rate_limit=0, rate_burst=10):
     app = Flask(__name__)
     app.config['PKI_DIR'] = pki_dir
     app.config['CA_CERT_PATH'] = ca_cert_path
     app.config['CA_KEY_PATH'] = ca_key_path
     app.config['CA_PASS_FILE'] = ca_pass_file
-    app.config['CRL_URLS'] = crl_urls          # изменено
-    app.config['OCSP_URL'] = ocsp_url          # изменено
+    app.config['CRL_URLS'] = crl_urls
+    app.config['OCSP_URL'] = ocsp_url
+
+    # Rate limiter
+    limiter = RateLimiter(rate_limit, rate_burst)
+    app.config['RATE_LIMITER'] = limiter
 
     db_path = Path(pki_dir) / 'micropki.db'
     certs_dir = Path(pki_dir) / 'certs'
 
-    # Configure HTTP logger
+    # Инициализация аудита
+    init_audit(Path(pki_dir))
+
     http_logger = logging.getLogger('micropki.http')
     if http_logger.handlers:
         http_logger.handlers.clear()
@@ -100,7 +107,6 @@ def create_app(pki_dir, log_file=None, log_format='text',
         cert_data = database.get_cert_by_serial(str(db_path), serial_hex)
         if cert_data:
             return Response(cert_data['cert_pem'], mimetype='application/x-pem-file')
-        # Fallback to filesystem search
         pem = find_cert_in_fs(certs_dir, serial)
         if pem:
             http_logger.info(f"Fallback: certificate {serial} found in filesystem (not in DB)")
@@ -135,22 +141,17 @@ def create_app(pki_dir, log_file=None, log_format='text',
 
     @app.route('/crl')
     def get_crl():
-        ca_param = request.args.get('ca', 'intermediate')  # по умолчанию intermediate
+        ca_param = request.args.get('ca', 'intermediate')
         if ca_param not in ('root', 'intermediate'):
             abort(400, description="ca parameter must be 'root' or 'intermediate'")
         crl_dir = Path(app.config.get('PKI_DIR', pki_dir)) / 'crl'
         crl_file = crl_dir / f'{ca_param}.crl.pem'
         if not crl_file.exists():
             abort(404, description=f"CRL for {ca_param} CA not found")
-        # Отдаём с правильным Content-Type
         response = Response(crl_file.read_bytes(), mimetype='application/pkix-crl')
-        # Добавляем кэширующие заголовки (опционально)
         mtime = os.path.getmtime(crl_file)
         response.headers['Last-Modified'] = datetime.fromtimestamp(mtime, timezone.utc).strftime('%a, %d %b %Y %H:%M:%S GMT')
-        # max-age = nextUpdate - now (упрощённо: 1 час, можно вычислить из метаданных)
-        # Для простоты ставим 3600 секунд
         response.headers['Cache-Control'] = 'max-age=3600'
-        # ETag можно добавить, но не обязательно
         return response
 
     @app.route('/request-cert', methods=['POST'])
@@ -191,9 +192,18 @@ def create_app(pki_dir, log_file=None, log_format='text',
             )
             with open(cert_path, 'rb') as f:
                 cert_pem = f.read()
+            # Аудит успеха
+            audit = get_audit_logger()
+            audit.log('AUDIT', 'request_cert', 'success',
+                      f"Certificate issued via API for CSR {tmp_csr_path}",
+                      {'template': template, 'requester_ip': request.remote_addr})
             return Response(cert_pem, status=201, mimetype='application/x-pem-file')
         except Exception as e:
             app.logger.error(f"Certificate issuance failed: {e}")
+            # Аудит ошибки
+            audit = get_audit_logger()
+            audit.log('ERROR', 'request_cert', 'failure', str(e),
+                      {'template': template, 'requester_ip': request.remote_addr})
             abort(500, description=str(e))
         finally:
             os.unlink(tmp_csr_path)
@@ -212,5 +222,21 @@ def create_app(pki_dir, log_file=None, log_format='text',
     def add_cors_headers(response):
         response.headers['Access-Control-Allow-Origin'] = '*'
         return response
+    @app.before_request
 
+    def check_rate_limit():
+        if rate_limit > 0:
+            client_ip = request.remote_addr
+            if not limiter.allow(client_ip):
+                # Логируем превышение
+                app.logger.warning(f"Rate limit exceeded for {client_ip}")
+                # Возвращаем 429 с заголовком Retry-After
+                response = Response("Too Many Requests", status=429)
+                response.headers['Retry-After'] = '1'
+                return response
+        return None
+
+    app.before_request(check_rate_limit)
     return app
+
+

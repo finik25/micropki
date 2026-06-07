@@ -1,21 +1,29 @@
+# micropki/ca.py
 import os
 import datetime
 from pathlib import Path
 from cryptography import x509
-from cryptography.hazmat._oid import NameOID
-from cryptography.hazmat.primitives import serialization
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
 from cryptography.hazmat.backends import default_backend
-
 from . import crypto_utils
 from . import certificates
 from .logger import setup_logging
 from . import database
+from .audit import ensure_audit, get_audit_logger
+from .certificates import check_validity_period, check_key_size, check_san_types
 
 
 def init_ca(subject, key_type, key_size, passphrase_file, out_dir, validity_days,
             log_file=None, force=False, log_format='text'):
+    # Инициализация аудита
+    ensure_audit(Path(out_dir))
     logger = setup_logging(log_file, log_format=log_format)
+
+    # Проверка политик
+    check_validity_period('root', validity_days)
+    check_key_size(key_type, key_size, 'root')
 
     if key_type == 'rsa' and key_size != 4096:
         raise ValueError(f"RSA key size must be 4096, got {key_size}")
@@ -75,15 +83,26 @@ def init_ca(subject, key_type, key_size, passphrase_file, out_dir, validity_days
         f.write(f"Creation Date: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n")
     logger.info(f"Policy document saved to {policy_path}")
 
+    audit = get_audit_logger()
+    audit.log('AUDIT', 'ca_init', 'success',
+              f"Root CA initialized: {subject}",
+              {'subject': subject, 'key_type': key_type, 'key_size': key_size,
+               'serial': hex(certificate.serial_number), 'validity_days': validity_days})
+
     return key_path, cert_path, policy_path
 
 
 def create_intermediate_ca(root_cert_path, root_key_path, root_pass_file, subject, key_type, key_size,
                            passphrase_file, out_dir, validity_days, pathlen, log_file=None, force=False,
                            pki_dir=None, log_format='text', crl_urls=None, ocsp_url=None):
+    # Инициализация аудита
+    ensure_audit(Path(pki_dir or out_dir))
     logger = setup_logging(log_file, log_format=log_format)
 
-    # Load root CA ( unchanged )
+    # Проверка политик
+    check_validity_period('intermediate', validity_days)
+    check_key_size(key_type, key_size, 'intermediate')
+
     with open(root_cert_path, 'rb') as f:
         root_cert = x509.load_pem_x509_certificate(f.read(), default_backend())
     with open(root_key_path, 'rb') as f:
@@ -92,11 +111,9 @@ def create_intermediate_ca(root_cert_path, root_key_path, root_pass_file, subjec
         root_pass = f.read().strip()
     root_private_key = serialization.load_pem_private_key(root_key_data, root_pass, default_backend())
 
-    # Read passphrase for intermediate key
     with open(passphrase_file, 'rb') as f:
         intermediate_pass = f.read().strip()
 
-    # Generate intermediate key
     logger.info("Generating intermediate CA private key...")
     if key_type == 'rsa':
         private_key = crypto_utils.generate_rsa_key()
@@ -181,15 +198,26 @@ def create_intermediate_ca(root_cert_path, root_key_path, root_pass_file, subjec
         f.write(f"Issuer: {root_cert.subject}\n")
     logger.info(f"Policy document updated at {policy_path}")
 
+    audit = get_audit_logger()
+    audit.log('AUDIT', 'issue_intermediate', 'success',
+              f"Intermediate CA issued: {subject}",
+              {'subject': subject, 'serial': cert_serial_hex,
+               'key_type': key_type, 'key_size': key_size, 'pathlen': pathlen,
+               'issuer': root_cert.subject.rfc4514_string()})
+
     return key_path, cert_path
 
 
 def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject, san_list,
                       out_dir, validity_days, csr_path=None, log_file=None, pki_dir=None,
                       log_format='text', force=False, crl_urls=None, ocsp_url=None):
+    # Инициализация аудита
+    ensure_audit(Path(pki_dir or out_dir))
     logger = setup_logging(log_file, log_format=log_format)
 
-    # Load CA ( unchanged )
+    # Проверка политик для end-entity
+    check_validity_period('end_entity', validity_days)
+
     with open(ca_cert_path, 'rb') as f:
         ca_cert = x509.load_pem_x509_certificate(f.read(), default_backend())
     with open(ca_key_path, 'rb') as f:
@@ -198,7 +226,6 @@ def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject
         ca_pass = f.read().strip()
     ca_private_key = serialization.load_pem_private_key(ca_key_data, ca_pass, default_backend())
 
-    # Determine pki_dir and db_path
     if pki_dir is None:
         pki_dir = Path(out_dir).parent
     db_path = Path(pki_dir) / 'micropki.db'
@@ -226,7 +253,8 @@ def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject
         cert_path = out_path / cert_filename
         key_path = None
 
-        # Extract SAN from CSR
+        # Извлечение SAN из CSR
+        san_objects = []
         try:
             san_ext = csr.extensions.get_extension_for_oid(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
             san_objects = san_ext.value
@@ -243,7 +271,28 @@ def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject
             logger.info(f"Extracted SANs from CSR: {san_strings}")
         except x509.ExtensionNotFound:
             logger.info("No SAN extension found in CSR")
-            san_strings = []
+            san_objects = []
+
+        # Проверка политики размера ключа из CSR
+        pub_key = csr.public_key()
+        if isinstance(pub_key, rsa.RSAPublicKey):
+            csr_key_type = 'rsa'
+            csr_key_size = pub_key.key_size
+        elif isinstance(pub_key, ec.EllipticCurvePublicKey):
+            csr_key_type = 'ecc'
+            csr_key_size = pub_key.curve.key_size
+        else:
+            raise ValueError("Unsupported public key algorithm in CSR")
+        check_key_size(csr_key_type, csr_key_size, 'end_entity')
+
+        # Проверка на скомпрометированный ключ
+        from . import crypto_utils
+        from . import database as db_module
+        pubkey_hash = crypto_utils.public_key_hash(pub_key)
+        if db_module.db_exists(str(db_path)) and db_module.is_key_compromised(str(db_path), pubkey_hash):
+            raise ValueError("The public key has been compromised and is blocked. Issuance rejected.")
+        # Проверка типов SAN
+        check_san_types(template, san_objects)
     else:
         if not subject:
             raise ValueError("Subject is required when CSR is not provided")
@@ -260,14 +309,18 @@ def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject
         cert_path = out_path / cert_filename
         key_path = out_path / key_filename
 
-    # Check existing files
+        # Для внутренней генерации ключ всегда RSA-2048, что допустимо
+        # Можно добавить проверку, но она пройдёт автоматически
+        # Создадим san_objects для проверки типов
+        san_objects = certificates.parse_san(san_strings) if san_strings else []
+        check_san_types(template, san_objects)
+
     if not force:
         if cert_path.exists():
             raise FileExistsError(f"Certificate file already exists: {cert_path}. Use --force to overwrite.")
         if key_path and key_path.exists():
             raise FileExistsError(f"Private key file already exists: {key_path}. Use --force to overwrite.")
 
-    # Generate unique serial
     serial_number = None
     if db_available:
         try:
@@ -281,6 +334,15 @@ def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject
     if csr_path:
         cert = certificates.sign_csr(csr, ca_cert, ca_private_key, validity_days, template, san_strings,
                                      serial_number=serial_number, crl_urls=crl_urls, ocsp_url=ocsp_url)
+        # CT-лог
+        try:
+            ct_log_path = Path(pki_dir) / 'audit' / 'ct.log'
+            ct_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(ct_log_path, 'a') as f:
+                fingerprint = cert.fingerprint(hashes.SHA256()).hex()
+                f.write(f"{datetime.datetime.now(datetime.timezone.utc).isoformat()} {hex(cert.serial_number)} {subject or effective_subject} {fingerprint}\n")
+        except Exception as e:
+            logger.warning(f"Failed to write CT log: {e}")
         cert_serial_hex = hex(cert.serial_number)
         db_inserted = False
         if db_available:
@@ -300,14 +362,35 @@ def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject
             if db_inserted:
                 database.update_cert_status(str(db_path), cert_serial_hex, 'revoked', reason='issuance_failed')
             raise
+
+        audit = get_audit_logger()
+        audit.log('AUDIT', 'issue_certificate', 'success',
+                  f"Issued {template} certificate for {effective_subject or subject}",
+                  {'serial': cert_serial_hex, 'subject': str(effective_subject) if effective_subject else subject,
+                   'template': template, 'san': san_strings, 'csr_used': True})
         return cert_path, None
     else:
         logger.info(f"Generating {template} private key...")
         ee_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+        # Проверка нового ключа (почти никогда не сработает, но для полноты)
+        from . import crypto_utils
+        from . import database as db_module
+        pubkey_hash = crypto_utils.public_key_hash(ee_private_key.public_key())
+        if db_module.db_exists(str(db_path)) and db_module.is_key_compromised(str(db_path), pubkey_hash):
+            raise ValueError("Generated key is already compromised (collision). This should not happen.")
         logger.info("Key generation completed.")
         csr = certificates.create_csr(subject, ee_private_key, extensions=None)
         cert = certificates.sign_csr(csr, ca_cert, ca_private_key, validity_days, template, san_strings,
                                      serial_number=serial_number, crl_urls=crl_urls, ocsp_url=ocsp_url)
+        # CT-лог
+        try:
+            ct_log_path = Path(pki_dir) / 'audit' / 'ct.log'
+            ct_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(ct_log_path, 'a') as f:
+                fingerprint = cert.fingerprint(hashes.SHA256()).hex()
+                f.write(f"{datetime.datetime.now(datetime.timezone.utc).isoformat()} {hex(cert.serial_number)} {subject or effective_subject} {fingerprint}\n")
+        except Exception as e:
+            logger.warning(f"Failed to write CT log: {e}")
         cert_serial_hex = hex(cert.serial_number)
         db_inserted = False
         if db_available:
@@ -337,7 +420,14 @@ def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject
             if db_inserted:
                 database.update_cert_status(str(db_path), cert_serial_hex, 'revoked', reason='issuance_failed')
             raise
+
+        audit = get_audit_logger()
+        audit.log('AUDIT', 'issue_certificate', 'success',
+                  f"Issued {template} certificate for {subject}",
+                  {'serial': cert_serial_hex, 'subject': subject,
+                   'template': template, 'san': san_strings, 'csr_used': False})
         return cert_path, key_path
+
 
 def verify_certificate(cert_path, subject_cert=None):
     from cryptography.hazmat.primitives.asymmetric import padding, ec

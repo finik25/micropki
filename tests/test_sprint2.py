@@ -83,7 +83,7 @@ def test_code_signing_with_email_san():
         pass_file = Path(tmpdir) / 'pass.txt'
         pass_file.write_text('secret')
         ca.init_ca('CN=Root', 'rsa', 4096, str(pass_file), str(root_dir), 365, force=True)
-        with pytest.raises(ValueError, match="only allows DNS or URI SANs"):
+        with pytest.raises(ValueError, match="SAN type 'email' is not allowed for code_signing certificate"):
             ca.issue_certificate(
                 ca_cert_path=str(root_dir/'certs'/'ca.cert.pem'),
                 ca_key_path=str(root_dir/'private'/'ca.key.pem'),

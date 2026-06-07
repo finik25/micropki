@@ -2,6 +2,7 @@ import os
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
 from cryptography.hazmat.backends import default_backend
+import hashlib
 
 def generate_rsa_key():
     """Generate 4096-bit RSA private key."""
@@ -33,3 +34,11 @@ def load_encrypted_private_key(pem_data, passphrase):
         password=passphrase,
         backend=default_backend()
     )
+
+def public_key_hash(public_key):
+    """Вычисляет SHA-256 хеш SPKI (SubjectPublicKeyInfo) публичного ключа."""
+    der = public_key.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    return hashlib.sha256(der).hexdigest()

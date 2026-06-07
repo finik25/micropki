@@ -2,6 +2,7 @@ import logging
 import sys
 import json
 from datetime import datetime
+from pathlib import Path   # <-- добавить эту строку
 
 class JSONFormatter(logging.Formatter):
     def format(self, record):
@@ -26,6 +27,8 @@ def setup_logging(log_file=None, level=logging.INFO, log_format='text', logger_n
         formatter = logging.Formatter('%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s',
                                       datefmt='%Y-%m-%dT%H:%M:%S')
     if log_file:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         fh = logging.FileHandler(log_file, mode='a')
         fh.setFormatter(formatter)
         logger.addHandler(fh)

@@ -7,7 +7,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 def db_exists(db_path):
     return os.path.exists(db_path)
@@ -74,6 +74,18 @@ def _apply_migration(db_path, from_ver, to_ver):
                 )
             ''')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_ca_subject ON crl_metadata(ca_subject)')
+        elif from_ver == 2 and to_ver == 3:
+            cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS compromised_keys (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            public_key_hash TEXT UNIQUE NOT NULL,
+                            certificate_serial TEXT NOT NULL,
+                            compromise_date TEXT NOT NULL,
+                            compromise_reason TEXT NOT NULL,
+                            FOREIGN KEY(certificate_serial) REFERENCES certificates(serial_hex)
+                        )
+                    ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_pubkey_hash ON compromised_keys(public_key_hash)')
         else:
             raise ValueError(f"Unknown migration from {from_ver} to {to_ver}")
         conn.commit()
@@ -250,3 +262,36 @@ def get_cert_object_by_serial_and_issuer(db_path, serial_hex, issuer_dn):
     if not row:
         return None
     return x509.load_pem_x509_certificate(row[0].encode('utf-8'), default_backend())
+
+def add_compromised_key(db_path, pubkey_hash, cert_serial, reason):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    try:
+        cursor.execute('''
+            INSERT INTO compromised_keys (public_key_hash, certificate_serial, compromise_date, compromise_reason)
+            VALUES (?, ?, ?, ?)
+        ''', (pubkey_hash, cert_serial, now, reason))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # already exists, ignore
+        pass
+    finally:
+        conn.close()
+
+def is_key_compromised(db_path, pubkey_hash):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute('SELECT 1 FROM compromised_keys WHERE public_key_hash = ?', (pubkey_hash,))
+    row = cursor.fetchone()
+    conn.close()
+    return row is not None
+
+def get_compromised_keys(db_path):
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM compromised_keys ORDER BY compromise_date DESC')
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
