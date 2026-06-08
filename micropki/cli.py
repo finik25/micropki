@@ -7,7 +7,6 @@ from pathlib import Path
 from . import ca
 from .config import load_config
 from .audit import get_audit_logger
-from . import database
 
 def main():
     parser = argparse.ArgumentParser(description='MicroPKI - Minimal PKI Tool')
@@ -73,7 +72,7 @@ def main():
     ocsp_cert_parser.add_argument('--ca-pass-file', required=True)
     ocsp_cert_parser.add_argument('--subject', required=True)
     ocsp_cert_parser.add_argument('--key-type', choices=['rsa', 'ecc'], default='rsa')
-    ocsp_cert_parser.add_argument('--key-size', type=int, default=2048)  # RSA min 2048
+    ocsp_cert_parser.add_argument('--key-size', type=int, default=2048)
     ocsp_cert_parser.add_argument('--san', action='append', help='DNS name or URI for responder')
     ocsp_cert_parser.add_argument('--out-dir', default='./pki/certs')
     ocsp_cert_parser.add_argument('--validity-days', type=int, default=365)
@@ -104,7 +103,7 @@ def main():
     req_cert_parser.add_argument('--out-cert', default='cert.pem', help='Output certificate file')
     req_cert_parser.add_argument('--force', action='store_true', help='Overwrite existing certificate')
 
-    # client validate (заглушка)
+    # client validate
     validate_parser = client_subparsers.add_parser('validate', help='Validate certificate chain')
     validate_parser.add_argument('--cert', required=True)
     validate_parser.add_argument('--untrusted', action='append', help='Intermediate certificate file')
@@ -113,7 +112,7 @@ def main():
     validate_parser.add_argument('--ocsp', action='store_true', help='Perform OCSP check')
     validate_parser.add_argument('--mode', choices=['chain', 'full'], default='full')
 
-    # client check-status (заглушка)
+    # client check-status
     check_parser = client_subparsers.add_parser('check-status', help='Check revocation status')
     check_parser.add_argument('--cert', required=True)
     check_parser.add_argument('--ca-cert', required=True, help='Issuer CA certificate')
@@ -148,7 +147,7 @@ def main():
     gen_crl_parser.add_argument('--ca-pass-file', required=True,
                                 help='File containing passphrase for CA private key')
 
-    # ca check-revoked (опционально)
+    # ca check-revoked
     check_revoked_parser = ca_subparsers.add_parser('check-revoked', help='Check revocation status of a certificate')
     check_revoked_parser.add_argument('serial', help='Certificate serial number (hex)')
     check_revoked_parser.add_argument('--pki-dir', default='./pki', help='PKI root directory')
@@ -218,7 +217,7 @@ def main():
     repo_status.add_argument('--host', default=None, help='Server host')
     repo_status.add_argument('--port', type=int, default=None, help='Server port')
 
-    # ocsp
+    # ---------- ocsp ----------
     ocsp_parser = subparsers.add_parser('ocsp', help='OCSP responder operations')
     ocsp_subparsers = ocsp_parser.add_subparsers(dest='ocsp_command', required=True)
 
@@ -235,7 +234,24 @@ def main():
     ocsp_serve_parser.add_argument('--rate-limit', type=float, default=0, help='Requests per second per IP (0 = disabled)')
     ocsp_serve_parser.add_argument('--rate-burst', type=int, default=10, help='Burst allowance')
 
-    # ---------- parse arguments ----------
+    # ---------- audit ----------
+    audit_parser = subparsers.add_parser('audit', help='Audit log operations')
+    audit_sub = audit_parser.add_subparsers(dest='audit_command', required=True)
+
+    query_parser = audit_sub.add_parser('query', help='Query audit log')
+    query_parser.add_argument('--from', dest='from_ts', help='Start timestamp (ISO8601)')
+    query_parser.add_argument('--to', help='End timestamp')
+    query_parser.add_argument('--level', choices=['INFO','WARNING','ERROR','AUDIT'])
+    query_parser.add_argument('--operation', help='Operation filter')
+    query_parser.add_argument('--serial', help='Filter by serial in metadata')
+    query_parser.add_argument('--format', choices=['table','json','csv'], default='table')
+    query_parser.add_argument('--verify', action='store_true', help='Verify integrity of retrieved entries')
+    query_parser.add_argument('--audit-dir', default='./pki/audit', help='Audit directory')
+
+    verify_parser = audit_sub.add_parser('verify', help='Verify full audit log integrity')
+    verify_parser.add_argument('--audit-dir', default='./pki/audit')
+
+    # ---------- парсинг аргументов ----------
     args = parser.parse_args()
 
     # Определяем pki_dir для инициализации аудита (если команда его использует)
@@ -247,24 +263,21 @@ def main():
             pki_dir_for_audit = args.out_dir
     elif args.command == 'repo' and args.repo_command == 'serve':
         pki_dir_for_audit = args.out_dir or load_config().get('pki_dir')
-    elif args.command == 'ocsp':
-        # для ocsp serve pki_dir не передаётся напрямую, но мы можем использовать текущую директорию или путь к БД
-        if args.ocsp_command == 'serve':
-            # берём директорию, содержащую db_path
-            db_path = Path(args.db_path)
-            pki_dir_for_audit = db_path.parent
-    # Инициализируем аудит, если определили директорию и это не client команда
+    elif args.command == 'ocsp' and args.ocsp_command == 'serve':
+        db_path = Path(args.db_path)
+        pki_dir_for_audit = db_path.parent
     if pki_dir_for_audit and args.command != 'client':
         from micropki.audit import init_audit
         init_audit(Path(pki_dir_for_audit))
 
-    # ---------- dispatch ----------
+    # ---------- диспетчеризация ----------
     if args.command == 'db':
         if args.db_command == 'init':
             db_path = Path(args.out_dir) / 'micropki.db'
             db_path.parent.mkdir(parents=True, exist_ok=True)
             try:
-                database.migrate(str(db_path))
+                import micropki.database as db_module
+                db_module.migrate(str(db_path))
                 print(f"Database initialized at {db_path}")
             except Exception as e:
                 sys.stderr.write(f"Error initializing database: {e}\n")
@@ -303,7 +316,6 @@ def main():
                 sys.stderr.write(f"Error: {e}\n")
                 sys.exit(1)
 
-
         elif args.ca_command == 'issue-cert':
             if not args.csr and not args.subject:
                 sys.stderr.write("Error: --subject is required when --csr is not provided.\n")
@@ -331,13 +343,11 @@ def main():
                     ocsp_url=args.ocsp_url
                 )
                 print("Certificate issued successfully.")
-
             except Exception as e:
                 sys.stderr.write(f"Error: {e}\n")
                 sys.exit(1)
 
         elif args.ca_command == 'issue-intermediate':
-            # Проверка существования обязательных файлов
             for f in [args.root_cert, args.root_key, args.root_pass_file, args.passphrase_file]:
                 if not os.path.isfile(f):
                     sys.stderr.write(f"Error: File not found: {f}\n")
@@ -395,11 +405,12 @@ def main():
                 sys.exit(1)
 
         elif args.ca_command == 'list-certs':
+            import micropki.database as db_module
             db_path = Path(args.pki_dir) / 'micropki.db'
-            if not database.db_exists(str(db_path)):
+            if not db_module.db_exists(str(db_path)):
                 sys.stderr.write(f"Database not found at {db_path}. Run 'micropki db init' first.\n")
                 sys.exit(1)
-            certs = database.list_certs(str(db_path), status=args.status, limit=args.limit)
+            certs = db_module.list_certs(str(db_path), status=args.status, limit=args.limit)
             if args.format == 'json':
                 print(json.dumps(certs, indent=2))
             elif args.format == 'csv':
@@ -422,14 +433,15 @@ def main():
                     print("No certificates found.")
 
         elif args.ca_command == 'show-cert':
+            import micropki.database as db_module
             db_path = Path(args.pki_dir) / 'micropki.db'
-            if not database.db_exists(str(db_path)):
+            if not db_module.db_exists(str(db_path)):
                 sys.stderr.write(f"Database not found at {db_path}. Run 'micropki db init' first.\n")
                 sys.exit(1)
             serial_arg = args.serial
             if not serial_arg.startswith('0x'):
                 serial_arg = '0x' + serial_arg
-            cert_data = database.get_cert_by_serial(str(db_path), serial_arg)
+            cert_data = db_module.get_cert_by_serial(str(db_path), serial_arg)
             if cert_data:
                 print(cert_data['cert_pem'])
             else:
@@ -437,11 +449,11 @@ def main():
                 sys.exit(1)
 
         elif args.ca_command == 'revoke':
+            import micropki.database as db_module
             from . import revocation
             db_path = Path(args.pki_dir) / 'micropki.db'
-            # Применяем миграции
-            database.migrate(str(db_path))
-            if not database.db_exists(str(db_path)):
+            db_module.migrate(str(db_path))
+            if not db_module.db_exists(str(db_path)):
                 sys.stderr.write(f"Database not found at {db_path}. Run 'micropki db init' first.\n")
                 sys.exit(1)
             try:
@@ -454,13 +466,12 @@ def main():
                 sys.stderr.write(f"Error: {e}\n")
                 sys.exit(1)
 
-
         elif args.ca_command == 'gen-crl':
+            import micropki.database as db_module
             from . import crl
             pki_dir = Path(args.pki_dir)
             db_path = pki_dir / 'micropki.db'
-            # Применяем миграции перед работой
-            database.migrate(str(db_path))
+            db_module.migrate(str(db_path))
             certs_dir = pki_dir / 'certs'
             private_dir = pki_dir / 'private'
             crl_dir = pki_dir / 'crl'
@@ -501,24 +512,23 @@ def main():
                 sys.exit(1)
 
         elif args.ca_command == 'check-revoked':
+            import micropki.database as db_module
             db_path = Path(args.pki_dir) / 'micropki.db'
-            if not database.db_exists(str(db_path)):
+            if not db_module.db_exists(str(db_path)):
                 sys.stderr.write(f"Database not found at {db_path}\n")
                 sys.exit(1)
             serial_hex = args.serial if args.serial.startswith('0x') else '0x' + args.serial
-            cert = database.get_cert_by_serial(str(db_path), serial_hex)
+            cert = db_module.get_cert_by_serial(str(db_path), serial_hex)
             if not cert:
                 print(f"Certificate {args.serial} not found")
                 sys.exit(1)
             if cert['status'] == 'revoked':
-                print(
-                    f"Certificate {args.serial} is REVOKED. Reason: {cert['revocation_reason']}, Date: {cert['revocation_date']}")
+                print(f"Certificate {args.serial} is REVOKED. Reason: {cert['revocation_reason']}, Date: {cert['revocation_date']}")
             else:
                 print(f"Certificate {args.serial} is {cert['status']} (not revoked)")
 
-
         elif args.ca_command == 'issue-ocsp-cert':
-            # Проверка ключей и файлов
+            import micropki.database as db_module
             if args.key_type == 'rsa' and args.key_size < 2048:
                 sys.stderr.write("Error: RSA key size must be at least 2048\n")
                 sys.exit(1)
@@ -530,8 +540,6 @@ def main():
                     sys.stderr.write(f"Error: File not found: {f}\n")
                     sys.exit(1)
 
-            # Подготовка БД
-            import micropki.database as db_module
             db_path = Path(args.pki_dir) / 'micropki.db'
             db_module.migrate(str(db_path))
             try:
@@ -560,7 +568,8 @@ def main():
         elif args.ca_command == 'compromise':
             from cryptography import x509
             from cryptography.hazmat.backends import default_backend
-            from . import revocation, crypto_utils, crl, database
+            from . import revocation, crypto_utils, crl
+            import micropki.database as db_module
             from .audit import audit_log
 
             cert_path = Path(args.cert)
@@ -572,12 +581,11 @@ def main():
             serial_hex = hex(cert.serial_number)
 
             db_path = Path(args.pki_dir) / 'micropki.db'
-            if not database.db_exists(str(db_path)):
+            if not db_module.db_exists(str(db_path)):
                 sys.stderr.write(f"Database not found: {db_path}\n")
                 sys.exit(1)
 
-            # Проверяем, существует ли сертификат в БД
-            cert_data = database.get_cert_by_serial(str(db_path), serial_hex)
+            cert_data = db_module.get_cert_by_serial(str(db_path), serial_hex)
             if not cert_data:
                 sys.stderr.write(f"Certificate with serial {serial_hex} not found in database\n")
                 sys.exit(1)
@@ -587,23 +595,17 @@ def main():
                 if not args.force:
                     sys.exit(0)
 
-            # Отзываем с указанной причиной
             revocation.revoke_certificate(str(db_path), serial_hex, reason=args.reason, force=args.force)
 
-            # Сохраняем хеш публичного ключа в compromised_keys
             pubkey_hash = crypto_utils.public_key_hash(cert.public_key())
-            database.add_compromised_key(str(db_path), pubkey_hash, serial_hex, args.reason)
+            db_module.add_compromised_key(str(db_path), pubkey_hash, serial_hex, args.reason)
 
-            # Генерируем CRL для соответствующего CA
-            # Определяем, какой CA выпустил сертификат (по полю issuer)
             issuer_dn = cert_data['issuer']
-            # Для упрощения: пробуем найти intermediate, иначе root
             ca_type = 'intermediate' if 'intermediate' in issuer_dn.lower() else 'root'
             ca_cert_path = Path(args.pki_dir) / 'certs' / f'{ca_type}.cert.pem'
             ca_key_path = Path(args.pki_dir) / 'private' / f'{ca_type}.key.pem'
-            ca_pass_file = Path(args.pki_dir) / f'{ca_type}_pass.txt'  # предполагаем стандартное имя
+            ca_pass_file = Path(args.pki_dir) / f'{ca_type}_pass.txt'
             if not ca_pass_file.exists():
-                # Пытаемся найти pass.txt или int_pass.txt
                 if ca_type == 'root':
                     ca_pass_file = Path(args.pki_dir) / 'pass.txt'
                 else:
@@ -611,13 +613,11 @@ def main():
             if ca_cert_path.exists() and ca_key_path.exists() and ca_pass_file.exists():
                 crl_file = Path(args.pki_dir) / 'crl' / f'{ca_type}.crl.pem'
                 try:
-                    crl.generate_crl(str(db_path), str(ca_cert_path), str(ca_key_path), str(ca_pass_file),
-                                     str(crl_file))
+                    crl.generate_crl(str(db_path), str(ca_cert_path), str(ca_key_path), str(ca_pass_file), str(crl_file))
                     print(f"Emergency CRL generated: {crl_file}")
                 except Exception as e:
                     print(f"Warning: Could not generate CRL: {e}")
 
-            # Аудит
             audit_log('AUDIT', 'compromise', 'success',
                       f"Certificate {serial_hex} marked as compromised",
                       {'serial': serial_hex, 'reason': args.reason})
@@ -658,6 +658,13 @@ def main():
     elif args.command == 'ocsp':
         if args.ocsp_command == 'serve':
             from .ocsp_responder import create_ocsp_app
+            from .audit import init_audit, get_audit_logger
+            # Определяем pki_dir как родительскую директорию базы данных
+            db_path = Path(args.db_path)
+            pki_dir = db_path.parent
+            init_audit(pki_dir)
+            audit = get_audit_logger()
+            audit.log('AUDIT', 'ocsp_start', 'success', f"OCSP responder starting on {args.host}:{args.port}", {})
             app = create_ocsp_app(
                 db_path=args.db_path,
                 responder_cert_path=args.responder_cert,
@@ -669,8 +676,10 @@ def main():
                 rate_limit=args.rate_limit,
                 rate_burst=args.rate_burst
             )
-            app.run(host=args.host, port=args.port, debug=False)
-
+            try:
+                app.run(host=args.host, port=args.port, debug=False)
+            finally:
+                audit.log('AUDIT', 'ocsp_stop', 'success', "OCSP responder stopped", {})
 
     elif args.command == 'client':
         from . import client
@@ -719,24 +728,8 @@ def main():
                     sys.stderr.write(f"[FAIL] {result['message']}\n")
                     sys.exit(1)
             except Exception as e:
-                sys.stderr.write(f"Error: {e}\n")
-                sys.exit(1)
-        elif args.client_command == 'check-status':
-            try:
-                status = client.check_status_cli(
-                    cert_path=args.cert,
-                    ca_cert_path=args.ca_cert,
-                    crl_source=args.crl,
-                    ocsp_url=args.ocsp_url
-                )
-                print(f"Status: {status['status']}")
-                if status.get('reason'):
-                    print(f"Reason: {status['reason']}")
-                if status.get('revocation_time'):
-                    print(f"Revocation time: {status['revocation_time']}")
-                if status['status'] != 'good':
-                    sys.exit(1)
-            except Exception as e:
+                import traceback
+                traceback.print_exc()   # <-- ДОБАВИТЬ ЭТУ СТРОКУ
                 sys.stderr.write(f"Error: {e}\n")
                 sys.exit(1)
 
@@ -762,7 +755,6 @@ def main():
                     writer.writeheader()
                     writer.writerows(records)
             else:  # table
-                # упрощённый вывод
                 for r in records:
                     print(f"{r['timestamp']} [{r['level']}] {r['operation']} {r['status']} - {r['message']}")
         elif args.audit_command == 'verify':
@@ -778,7 +770,6 @@ def main():
     else:
         parser.print_help()
         sys.exit(1)
-
 
 if __name__ == '__main__':
     main()

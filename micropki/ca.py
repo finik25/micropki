@@ -95,6 +95,11 @@ def init_ca(subject, key_type, key_size, passphrase_file, out_dir, validity_days
 def create_intermediate_ca(root_cert_path, root_key_path, root_pass_file, subject, key_type, key_size,
                            passphrase_file, out_dir, validity_days, pathlen, log_file=None, force=False,
                            pki_dir=None, log_format='text', crl_urls=None, ocsp_url=None):
+    # <-- NEW: запрет pathlen > 0
+    if pathlen != 0:
+        raise ValueError("Intermediate CA must have path length constraint 0 (cannot issue subordinate CAs). Use 0.")
+    # <-- END NEW
+
     # Инициализация аудита
     ensure_audit(Path(pki_dir or out_dir))
     logger = setup_logging(log_file, log_format=log_format)
@@ -242,6 +247,17 @@ def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject
         with open(csr_path, 'rb') as f:
             csr_data = f.read()
         csr = x509.load_pem_x509_csr(csr_data, default_backend())
+
+        # <-- NEW: проверка алгоритма подписи CSR
+        if csr.signature_hash_algorithm is None:
+            raise ValueError("CSR signature algorithm is missing (unsigned CSR?)")
+        if isinstance(csr.signature_hash_algorithm, hashes.SHA1):
+            raise ValueError("SHA-1 signature algorithm is forbidden for CSR")
+        allowed_algos = (hashes.SHA256, hashes.SHA384, hashes.SHA512)
+        if not isinstance(csr.signature_hash_algorithm, allowed_algos):
+            raise ValueError(f"Unsupported signature hash algorithm: {type(csr.signature_hash_algorithm).__name__}")
+        # <-- END NEW
+
         effective_subject = csr.subject
         for attr in effective_subject:
             if attr.oid == NameOID.COMMON_NAME:
@@ -310,7 +326,6 @@ def issue_certificate(ca_cert_path, ca_key_path, ca_pass_file, template, subject
         key_path = out_path / key_filename
 
         # Для внутренней генерации ключ всегда RSA-2048, что допустимо
-        # Можно добавить проверку, но она пройдёт автоматически
         # Создадим san_objects для проверки типов
         san_objects = certificates.parse_san(san_strings) if san_strings else []
         check_san_types(template, san_objects)
