@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MicroPKI Demo Script - Sprint 8 (final) с TLS-сервером и корректными SAN"""
+"""MicroPKI Demo Script - Sprint 8 (финальная рабочая версия с русским выводом)"""
 
 import os
 import sys
@@ -22,7 +22,7 @@ def run_cmd(cmd, capture=False, check=True):
         result = subprocess.run(cmd, capture_output=True, text=True)
         if check and result.returncode != 0:
             print(result.stderr)
-            raise RuntimeError(f"Command failed with exit code {result.returncode}")
+            raise RuntimeError(f"Команда завершилась с кодом {result.returncode}")
         return result
     else:
         subprocess.run(cmd, check=check)
@@ -63,7 +63,7 @@ def main():
     logs_dir = Path(tmpdir) / "logs"
     pki_dir.mkdir()
     logs_dir.mkdir()
-    print(f"Working directory: {tmpdir}")
+    print(f"Рабочая директория: {tmpdir}")
 
     root_pass = pki_dir / "root_pass.txt"
     root_pass.write_text("rootsecret")
@@ -79,6 +79,7 @@ def main():
         "--out-dir", str(pki_dir),
         "--validity-days", "3650", "--force"
     ])
+    print("✅ Корневой ЦС создан")
 
     # 2. Intermediate CA
     run_cmd([
@@ -95,12 +96,14 @@ def main():
         "--crl-url", "http://127.0.0.1:8080/crl?ca=intermediate",
         "--ocsp-url", "http://127.0.0.1:8081/ocsp"
     ])
+    print("✅ Промежуточный ЦС создан")
 
     # 3. Init DB
     run_cmd([
         sys.executable, "-m", "micropki", "db", "init",
         "--out-dir", str(pki_dir)
     ])
+    print("✅ База данных инициализирована")
 
     # 4. OCSP certificate
     run_cmd([
@@ -113,6 +116,7 @@ def main():
         "--out-dir", str(pki_dir / "certs"), "--force",
         "--pki-dir", str(pki_dir)
     ])
+    print("✅ OCSP-сертификат выпущен")
 
     # 5. Start repo and OCSP
     repo_proc = subprocess.Popen([
@@ -144,6 +148,7 @@ def main():
         "--ca-pass-file", str(int_pass),
         "--pki-dir", str(pki_dir), "--force"
     ])
+    print("✅ Начальный CRL создан")
 
     # 7. Сертификат для отзыва (с поддержкой 127.0.0.1)
     run_cmd([
@@ -161,6 +166,7 @@ def main():
         "--pki-dir", str(pki_dir),
         "--force"
     ])
+    print("✅ Сертификат для отзыва выпущен")
 
     cert_revoke = pki_dir / "certs" / "revoke-test.local.cert.pem"
     key_revoke = pki_dir / "certs" / "revoke-test.local.key.pem"
@@ -170,7 +176,7 @@ def main():
             cert_revoke = certs[-1]
             key_revoke = cert_revoke.with_suffix('.key.pem')
         else:
-            raise RuntimeError("No certificate found for revocation test")
+            raise RuntimeError("Не найден сертификат для теста отзыва")
 
     # Получаем серийный номер
     from cryptography import x509
@@ -178,22 +184,22 @@ def main():
     with open(cert_revoke, 'rb') as f:
         cert = x509.load_pem_x509_certificate(f.read(), default_backend())
     serial_hex = hex(cert.serial_number)
-    print(f"Certificate for revocation serial: {serial_hex}")
+    print(f"Серийный номер сертификата для отзыва: {serial_hex}")
 
     # 8. Проверка статуса до отзыва
-    print("\n=== Checking revocation status BEFORE revocation ===")
+    print("\n=== Проверка статуса отзыва ДО отзыва ===")
     result_before = run_cmd([
         sys.executable, "-m", "micropki", "ca", "check-revoked",
         serial_hex, "--pki-dir", str(pki_dir)
     ], capture=True)
     if "not revoked" in result_before.stdout.lower():
-        print("✅ Certificate NOT revoked (as expected)")
+        print("✅ Сертификат НЕ отозван (как и ожидалось)")
     else:
-        print("❌ Unexpected status before revocation:", result_before.stdout)
-        raise RuntimeError("Status before revocation not 'not revoked'")
+        print("❌ Неожиданный статус до отзыва:", result_before.stdout)
+        raise RuntimeError("Статус до отзыва не 'not revoked'")
 
     # 9. TLS-сервер и проверка
-    print("\n=== Starting HTTPS server with full certificate chain ===")
+    print("\n=== Запуск HTTPS-сервера с полной цепочкой сертификатов ===")
     # Создаём bundle для клиента: root + intermediate
     bundle_path = pki_dir / "ca_bundle.pem"
     with open(bundle_path, 'wb') as bundle:
@@ -208,15 +214,15 @@ def main():
     try:
         resp = requests.get('https://127.0.0.1:8443', verify=str(bundle_path), timeout=5)
         if resp.status_code == 200:
-            print("✅ TLS connection successful (certificate valid)")
+            print("✅ TLS-соединение успешно (сертификат доверен)")
         else:
-            print(f"⚠️ TLS connection returned HTTP {resp.status_code}")
+            print(f"⚠️ TLS-соединение вернуло HTTP {resp.status_code}")
     except Exception as e:
-        print(f"❌ TLS connection failed: {e}")
-        raise RuntimeError("TLS handshake failed before revocation")
+        print(f"❌ TLS-соединение не удалось: {e}")
+        raise RuntimeError("TLS handshake не удался до отзыва")
 
     # 10. Отзыв сертификата
-    print(f"\n=== Revoking certificate with serial {serial_hex} ===")
+    print(f"\n=== Отзыв сертификата с серийным номером {serial_hex} ===")
     run_cmd([
         sys.executable, "-m", "micropki", "ca", "revoke",
         serial_hex,
@@ -233,23 +239,23 @@ def main():
     ])
 
     # 12. Проверка статуса после отзыва (через БД)
-    print("\n=== Checking revocation status AFTER revocation ===")
+    print("\n=== Проверка статуса отзыва ПОСЛЕ отзыва ===")
     result_after = run_cmd([
         sys.executable, "-m", "micropki", "ca", "check-revoked",
         serial_hex, "--pki-dir", str(pki_dir)
     ], capture=True)
     if "revoked" in result_after.stdout.lower():
-        print("✅ Certificate correctly detected as revoked")
+        print("✅ Сертификат корректно обнаружен как отозванный")
     else:
-        print("❌ Revocation not detected:", result_after.stdout)
-        raise RuntimeError("Revocation not detected")
+        print("❌ Отзыв не обнаружен:", result_after.stdout)
+        raise RuntimeError("Отзыв не обнаружен")
 
     # Останавливаем TLS-сервер
     server.shutdown()
     time.sleep(1)
 
     # 13. Клиентские команды (демонстрация API)
-    print("\n=== Client tools demo (CSR + request-cert) ===")
+    print("\n=== Демонстрация клиентских команд (CSR + request-cert) ===")
     client_key = pki_dir / "client.key"
     client_csr = pki_dir / "client.csr"
     client_cert = pki_dir / "client.cert"
@@ -264,10 +270,10 @@ def main():
         "--ca-url", "http://127.0.0.1:8080",
         "--out-cert", str(client_cert), "--force"
     ])
-    print("✅ API-issued certificate saved")
+    print("✅ Сертификат, выданный через API, сохранён")
 
     # 14. Code signing demo
-    print("\n=== Code signing demo ===")
+    print("\n=== Демонстрация подписи кода ===")
     code_key = pki_dir / "code.key"
     code_csr = pki_dir / "code.csr"
     code_cert = pki_dir / "code.cert"
@@ -301,10 +307,10 @@ def main():
         shell=True, capture_output=True, text=True
     )
     if verify_res.returncode == 0:
-        print("✅ Code signing: SUCCESS")
+        print("✅ Подпись кода успешно проверена")
     else:
-        print("❌ Code signing: FAILED", verify_res.stderr)
-        raise RuntimeError("Code signing failed")
+        print("❌ Ошибка верификации подписи кода:", verify_res.stderr)
+        raise RuntimeError("Ошибка верификации подписи кода")
 
     # 15. Audit log verification
     audit_res = run_cmd([
@@ -312,9 +318,9 @@ def main():
         "--audit-dir", str(pki_dir / "audit")
     ], capture=True)
     if "OK" in audit_res.stdout:
-        print("✅ Audit log integrity: OK")
+        print("✅ Аудит-лог корректен")
     else:
-        raise RuntimeError("Audit log verification failed")
+        raise RuntimeError("Ошибка верификации аудит-лога")
 
     # 16. Cleanup
     repo_proc.terminate()
@@ -322,11 +328,23 @@ def main():
     time.sleep(1)
 
     print("\n" + "=" * 50)
-    print("✅ Demo completed successfully!")
-    print(f"All artifacts in {tmpdir}")
-    print("Press Enter to delete or Ctrl+C to keep")
+    print("✅ Демонстрация успешно завершена!")
+    print(f"Все артефакты в {tmpdir}")
+
+    # 17. Запуск тестов по нажатию Enter
+    print("\nНажмите Enter, чтобы запустить все тесты (pytest), или Ctrl+C для выхода.")
+    input()
+    print("\n=== Запуск тестов ===")
+    test_result = subprocess.run([sys.executable, "-m", "pytest", "tests/", "-v"])
+    if test_result.returncode == 0:
+        print("✅ Все тесты прошли успешно")
+    else:
+        print("❌ Некоторые тесты не прошли")
+
+    print("\nНажмите Enter для удаления временных файлов.")
     input()
     shutil.rmtree(tmpdir)
+    print("Временные файлы удалены.")
 
 
 if __name__ == "__main__":
