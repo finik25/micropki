@@ -10,7 +10,10 @@ setup(
         ],
     },
     install_requires=[
-        'cryptography>=3.0',
+        'cryptography>=42.0.0',
+        'pyyaml>=6.0',
+        'requests>=2.25.0',
+        'Flask>=2.0',
     ],
     python_requires='>=3.8',
 )
